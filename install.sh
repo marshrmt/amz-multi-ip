@@ -282,137 +282,83 @@ xray_remove_ip() {
 }
 
 build_xray_config() {
-  local priv
-  priv="$(jq -r '.xray.private_key' "$STATE_FILE")"
+  local tmp priv
 
-  mkdir -p /usr/local/etc/xray
-  local cfg
-  cfg="$(mktemp)"
+  priv="$(jq -r '.xray.private_key // ""' "$STATE_FILE")"
+  [[ -n "$priv" ]] || err "xray.private_key is empty in $STATE_FILE"
 
-  {
-    echo '{'
-    echo '  "log": {"loglevel": "warning"},'
-    echo '  "inbounds": ['
-  } > "$cfg"
+  tmp="$(mktemp)"
 
-  local count=0 total
-  total="$(jq '.xray.clients | length' "$STATE_FILE")"
-
-  jq -r '
-    .xray.clients
-    | to_entries
-    | sort_by(.key)
-    | .[]
-    | @base64
-  ' "$STATE_FILE" | while IFS= read -r row; do
-    local entry ip port uuid sid
-    entry="$(echo "$row" | base64 -d)"
-    ip="$(jq -r '.key' <<<"$entry")"
-    port="$(jq -r '.value.port' <<<"$entry")"
-    uuid="$(jq -r '.value.uuid' <<<"$entry")"
-    sid="$(jq -r '.value.short_id' <<<"$entry")"
-
-    cat >> "$cfg" <<EOF
-    {
-      "tag": "in_${ip//./_}",
-      "listen": "$ip",
-      "port": $port,
-      "protocol": "vless",
-      "settings": {
-        "clients": [
-          {
-            "id": "$uuid",
-            "flow": "xtls-rprx-vision"
-          }
-        ],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "tcp",
-        "security": "reality",
-        "realitySettings": {
-          "show": false,
-          "dest": "${SNI}:443",
-          "xver": 0,
-          "serverNames": ["${SNI}"],
-          "privateKey": "$priv",
-          "shortIds": ["$sid"]
+  jq -n --arg priv "$priv" --slurpfile st "$STATE_FILE" '
+    ($st[0].xray.clients // {}) as $clients
+    | {
+        log: {
+          loglevel: "warning"
+        },
+        inbounds: (
+          $clients
+          | to_entries
+          | sort_by(.key)
+          | map({
+              tag: ("in_" + (.key | gsub("\\."; "_"))),
+              listen: .key,
+              port: .value.port,
+              protocol: "vless",
+              settings: {
+                clients: [
+                  {
+                    id: .value.uuid,
+                    flow: "xtls-rprx-vision"
+                  }
+                ],
+                decryption: "none"
+              },
+              streamSettings: {
+                network: "tcp",
+                security: "reality",
+                realitySettings: {
+                  show: false,
+                  dest: (.value.sni + ":443"),
+                  xver: 0,
+                  serverNames: [ .value.sni ],
+                  privateKey: $priv,
+                  shortIds: [ .value.short_id ]
+                }
+              },
+              sniffing: {
+                enabled: true,
+                destOverride: ["http", "tls", "quic"]
+              }
+            })
+        ),
+        outbounds: (
+          $clients
+          | to_entries
+          | sort_by(.key)
+          | map({
+              tag: ("out_" + (.key | gsub("\\."; "_"))),
+              protocol: "freedom",
+              settings: {},
+              sendThrough: .key
+            })
+        ),
+        routing: {
+          domainStrategy: "AsIs",
+          rules: (
+            $clients
+            | to_entries
+            | sort_by(.key)
+            | map({
+                type: "field",
+                inboundTag: [("in_" + (.key | gsub("\\."; "_")))],
+                outboundTag: ("out_" + (.key | gsub("\\."; "_")))
+              })
+          )
         }
-      },
-      "sniffing": {
-        "enabled": true,
-        "destOverride": ["http", "tls", "quic"]
       }
-    }
-EOF
-    count=$((count+1))
-    [[ "$count" -lt "$total" ]] && echo "    ," >> "$cfg"
-  done
+  ' > "$tmp"
 
-  {
-    echo '  ],'
-    echo '  "outbounds": ['
-  } >> "$cfg"
-
-  count=0
-  jq -r '
-    .xray.clients
-    | to_entries
-    | sort_by(.key)
-    | .[]
-    | @base64
-  ' "$STATE_FILE" | while IFS= read -r row; do
-    local entry ip
-    entry="$(echo "$row" | base64 -d)"
-    ip="$(jq -r '.key' <<<"$entry")"
-    cat >> "$cfg" <<EOF
-    {
-      "tag": "out_${ip//./_}",
-      "protocol": "freedom",
-      "settings": {},
-      "sendThrough": "$ip"
-    }
-EOF
-    count=$((count+1))
-    [[ "$count" -lt "$total" ]] && echo "    ," >> "$cfg"
-  done
-
-  {
-    echo '  ],'
-    echo '  "routing": {'
-    echo '    "domainStrategy": "AsIs",'
-    echo '    "rules": ['
-  } >> "$cfg"
-
-  count=0
-  jq -r '
-    .xray.clients
-    | to_entries
-    | sort_by(.key)
-    | .[]
-    | @base64
-  ' "$STATE_FILE" | while IFS= read -r row; do
-    local entry ip
-    entry="$(echo "$row" | base64 -d)"
-    ip="$(jq -r '.key' <<<"$entry")"
-    cat >> "$cfg" <<EOF
-      {
-        "type": "field",
-        "inboundTag": ["in_${ip//./_}"],
-        "outboundTag": "out_${ip//./_}"
-      }
-EOF
-    count=$((count+1))
-    [[ "$count" -lt "$total" ]] && echo "      ," >> "$cfg"
-  done
-
-  {
-    echo '    ]'
-    echo '  }'
-    echo '}'
-  } >> "$cfg"
-
-  mv "$cfg" "$XRAY_CONFIG"
+  mv "$tmp" "$XRAY_CONFIG"
   chmod 600 "$XRAY_CONFIG"
 }
 
