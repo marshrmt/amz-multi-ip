@@ -599,6 +599,7 @@ generate_vpn_uri() {
     local name="$1"
     local conf_file="$AWG_DIR/${name}.conf"
     local uri_file="$AWG_DIR/${name}.vpnuri"
+    local endpoint_override=""
 
     if [[ ! -f "$conf_file" ]]; then
         log_error "Client config '$name' not found: $conf_file"
@@ -631,6 +632,10 @@ generate_vpn_uri() {
         # IPv4/hostname: addr:port
         endpoint="${raw_endpoint%:*}"
     fi
+    if [[ "$name" =~ ^awg-([0-9]+)-([0-9]+)-([0-9]+)-([0-9]+)$ ]]; then
+        endpoint_override="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}.${BASH_REMATCH[4]}"
+        endpoint="$endpoint_override"
+    fi
     allowed_ips=$(grep -oP 'AllowedIPs\s*=\s*\K.+' "$conf_file" | tr -d ' ') || allowed_ips="0.0.0.0/0"
 
     local vpn_uri perl_err
@@ -643,6 +648,7 @@ generate_vpn_uri() {
         open my $fh, "<", $conf_path or die;
         local $/; my $raw = <$fh>; close $fh;
         chomp $raw;
+        $raw =~ s/^Endpoint\s*=\s*.*$/Endpoint = $ep:$port/m;
 
         sub je {
             my $s = shift;
