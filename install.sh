@@ -692,9 +692,9 @@ force_awg_ipv4_only_defaults() {
   fi
 
   if grep -q '^export ALLOWED_IPS=' "${AWG_DIR}/awgsetup_cfg.init"; then
-    sed -i "s|^export ALLOWED_IPS=.*|export ALLOWED_IPS='0.0.0.0/0,::/0'|" "${AWG_DIR}/awgsetup_cfg.init"
+    sed -i "s|^export ALLOWED_IPS=.*|export ALLOWED_IPS='0.0.0.0/0, ::/0'|" "${AWG_DIR}/awgsetup_cfg.init"
   else
-    printf "export ALLOWED_IPS='0.0.0.0/0,::/0'\n" >> "${AWG_DIR}/awgsetup_cfg.init"
+    printf "export ALLOWED_IPS='0.0.0.0/0, ::/0'\n" >> "${AWG_DIR}/awgsetup_cfg.init"
   fi
 }
 
@@ -774,7 +774,7 @@ enforce_awg_client_ipv4_only() {
   local name="$1"
   local conf_path="${AWG_DIR}/${name}.conf"
   local current_endpoint=""
-  local allowed_ips="0.0.0.0/0,::/0"
+  local allowed_ips="0.0.0.0/0, ::/0"
 
   if [[ -x "${AWG_DIR}/manage_amneziawg.sh" ]]; then
     bash "${AWG_DIR}/manage_amneziawg.sh" modify "$name" AllowedIPs "$allowed_ips" >/dev/null 2>&1 || true

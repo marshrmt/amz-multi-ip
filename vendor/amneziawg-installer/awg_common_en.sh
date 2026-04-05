@@ -306,7 +306,7 @@ render_client_config() {
     load_awg_params || return 1
 
     local conf_file="$AWG_DIR/${name}.conf"
-    local allowed_ips="${ALLOWED_IPS:-0.0.0.0/0,::/0}"
+    local allowed_ips="${ALLOWED_IPS:-0.0.0.0/0, ::/0}"
 
     local tmpfile
     tmpfile=$(awg_mktemp) || { log_error "mktemp failed"; return 1; }
@@ -636,7 +636,7 @@ generate_vpn_uri() {
         endpoint_override="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}.${BASH_REMATCH[4]}"
         endpoint="$endpoint_override"
     fi
-    allowed_ips=$(grep -oP 'AllowedIPs\s*=\s*\K.+' "$conf_file" | tr -d ' ') || allowed_ips="0.0.0.0/0,::/0"
+    allowed_ips=$(grep -oP 'AllowedIPs\s*=\s*\K.+' "$conf_file" | sed 's/[[:space:]]*,[[:space:]]*/, /g') || allowed_ips="0.0.0.0/0, ::/0"
 
     local vpn_uri perl_err
     perl_err=$(awg_mktemp) || perl_err="/tmp/awg_perl_err.$$"
@@ -666,7 +666,7 @@ generate_vpn_uri() {
             $inner .= qq("I1":"$ei1","I2":"","I3":"","I4":"","I5":"",);
         }
         my $eraw = je($raw);
-        my @ips = split(/,/, $aips);
+        my @ips = split(/\s*,\s*/, $aips);
         my $ips_json = join(",", map { qq("$_") } @ips);
         $inner .= qq("allowed_ips":[$ips_json],);
         $inner .= qq("client_ip":"$cip","client_priv_key":"$cpk",);
@@ -857,14 +857,14 @@ regenerate_client() {
     }
 
     # Preserve user settings from current .conf (modified via modify command)
-    local current_dns="1.1.1.1" current_keepalive="33" current_allowed_ips="${ALLOWED_IPS:-0.0.0.0/0,::/0}" current_endpoint=""
+    local current_dns="1.1.1.1" current_keepalive="33" current_allowed_ips="${ALLOWED_IPS:-0.0.0.0/0, ::/0}" current_endpoint=""
     if [[ -f "$AWG_DIR/${name}.conf" ]]; then
         local _v
         _v=$(sed -n 's/^DNS[ \t]*=[ \t]*//p' "$AWG_DIR/${name}.conf" | tr -d '[:space:]')
         [[ -n "$_v" ]] && current_dns="$_v"
         _v=$(sed -n 's/^PersistentKeepalive[ \t]*=[ \t]*//p' "$AWG_DIR/${name}.conf" | tr -d '[:space:]')
         [[ -n "$_v" ]] && current_keepalive="$_v"
-        _v=$(sed -n '/^\[Peer\]/,$ s/^AllowedIPs[ \t]*=[ \t]*//p' "$AWG_DIR/${name}.conf" | tr -d '[:space:]')
+        _v=$(sed -n '/^\[Peer\]/,$ s/^AllowedIPs[ \t]*=[ \t]*//p' "$AWG_DIR/${name}.conf" | sed 's/[[:space:]]*,[[:space:]]*/, /g' | tr -d '\r' | head -n1)
         [[ -n "$_v" ]] && current_allowed_ips="$_v"
         _v=$(sed -n '/^\[Peer\]/,$ s/^Endpoint[ \t]*=[ \t]*//p' "$AWG_DIR/${name}.conf" | tr -d '[:space:]' | head -n1)
         if [[ -n "$_v" ]]; then
