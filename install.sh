@@ -235,7 +235,7 @@ xray_add_ip() {
   name="xray-${ip//./-}"
   pub="$(jq -r '.xray.public_key' "$STATE_FILE")"
 
-  url="vless://${uuid}@${ip}:${port}?type=tcp&security=reality&pbk=${pub}&fp=chrome&sni=${SNI}&sid=${sid}&spx=%2F&flow=xtls-rprx-vision#${name}"
+  url="vless://${uuid}@${ip}:${port}?encryption=none&type=tcp&security=reality&pbk=${pub}&fp=chrome&sni=${SNI}&sid=${sid}&flow=xtls-rprx-vision#${name}"
 
   tmp="$(mktemp)"
   jq --arg ip "$ip" \
