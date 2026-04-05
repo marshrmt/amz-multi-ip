@@ -629,7 +629,7 @@ install_awg_base() {
   curl -fsSL "$AWG_INSTALL_SCRIPT_URL" -o /root/install_amneziawg_en.sh
   chmod +x /root/install_amneziawg_en.sh
 
-  if AMZ_AWG_VENDOR_BASE_URL="$AWG_VENDOR_BASE_URL" bash /root/install_amneziawg_en.sh --yes --route-all --port="${port}"; then
+  if AMZ_AWG_VENDOR_BASE_URL="$AWG_VENDOR_BASE_URL" bash /root/install_amneziawg_en.sh --yes --route-all --disallow-ipv6 --port="${port}"; then
     installer_rc=0
   else
     installer_rc=$?
@@ -662,6 +662,22 @@ get_awg_port() {
 
 get_awg_tunnel_subnet() {
   awk -F= '/^export AWG_TUNNEL_SUBNET=/{gsub(/'\''|"/,"",$2); print $2}' "${AWG_DIR}/awgsetup_cfg.init" | tail -n1
+}
+
+force_awg_ipv4_only_defaults() {
+  [[ -f "${AWG_DIR}/awgsetup_cfg.init" ]] || return 0
+
+  if grep -q '^export DISABLE_IPV6=' "${AWG_DIR}/awgsetup_cfg.init"; then
+    sed -i "s/^export DISABLE_IPV6=.*/export DISABLE_IPV6=1/" "${AWG_DIR}/awgsetup_cfg.init"
+  else
+    printf 'export DISABLE_IPV6=1\n' >> "${AWG_DIR}/awgsetup_cfg.init"
+  fi
+
+  if grep -q '^export ALLOWED_IPS=' "${AWG_DIR}/awgsetup_cfg.init"; then
+    sed -i "s|^export ALLOWED_IPS=.*|export ALLOWED_IPS='0.0.0.0/0'|" "${AWG_DIR}/awgsetup_cfg.init"
+  else
+    printf "export ALLOWED_IPS='0.0.0.0/0'\n" >> "${AWG_DIR}/awgsetup_cfg.init"
+  fi
 }
 
 ensure_awg_port_saved() {
@@ -714,6 +730,44 @@ cleanup_legacy_awg_masquerade_rules() {
   done
 
   iptables -t nat -A POSTROUTING -s "$subnet" -o "$nic" -j MASQUERADE
+}
+
+strip_awg_ipv6_server_rules() {
+  [[ -f "$AWG_SERVER_CONF" ]] || return 0
+
+  perl -0pi -e 's/; ip6tables -I FORWARD -i %i -j ACCEPT; ip6tables -t nat -A POSTROUTING -o [^;]+ -j MASQUERADE//g; s/; ip6tables -D FORWARD -i %i -j ACCEPT; ip6tables -t nat -D POSTROUTING -o [^;]+ -j MASQUERADE//g' "$AWG_SERVER_CONF"
+}
+
+cleanup_awg_ipv6_runtime_rules() {
+  local nic="$1"
+
+  command -v ip6tables >/dev/null 2>&1 || return 0
+
+  while ip6tables -C FORWARD -i awg0 -j ACCEPT 2>/dev/null; do
+    ip6tables -D FORWARD -i awg0 -j ACCEPT || true
+  done
+
+  while ip6tables -t nat -C POSTROUTING -o "$nic" -j MASQUERADE 2>/dev/null; do
+    ip6tables -t nat -D POSTROUTING -o "$nic" -j MASQUERADE || true
+  done
+}
+
+enforce_awg_client_ipv4_only() {
+  local name="$1"
+  local conf_path="${AWG_DIR}/${name}.conf"
+  local allowed_ips="0.0.0.0/0"
+
+  if [[ -x "${AWG_DIR}/manage_amneziawg.sh" ]]; then
+    bash "${AWG_DIR}/manage_amneziawg.sh" modify "$name" AllowedIPs "$allowed_ips" >/dev/null 2>&1 || true
+  fi
+
+  [[ -f "$conf_path" ]] || return 0
+
+  sed -i "s|^AllowedIPs = .*|AllowedIPs = ${allowed_ips}|" "$conf_path"
+
+  if [[ -x "${AWG_DIR}/manage_amneziawg.sh" ]]; then
+    bash "${AWG_DIR}/manage_amneziawg.sh" regen "$name" >/dev/null 2>&1 || true
+  fi
 }
 
 awg_has_ip() {
@@ -884,6 +938,7 @@ awg_add_ip() {
 
   bash "${AWG_DIR}/manage_amneziawg.sh" add "$name"
   bash "${AWG_DIR}/manage_amneziawg.sh" modify "$name" Endpoint "${ip}:${port}" || true
+  enforce_awg_client_ipv4_only "$name"
 
   refresh_awg_ip_state "$ip" "$name"
   log "Added AWG client for ${ip}"
@@ -897,6 +952,7 @@ awg_import_existing_ip() {
   port="$(jq -r '.awg.port' "$STATE_FILE")"
 
   bash "${AWG_DIR}/manage_amneziawg.sh" modify "$name" Endpoint "${ip}:${port}" || true
+  enforce_awg_client_ipv4_only "$name"
   refresh_awg_ip_state "$ip" "$name"
   log "Imported existing AWG client for ${ip}"
 }
@@ -913,6 +969,7 @@ awg_refresh_existing_ip() {
     bash "${AWG_DIR}/manage_amneziawg.sh" modify "$name" Endpoint "${ip}:${port}" || true
   fi
 
+  enforce_awg_client_ipv4_only "$name"
   refresh_awg_ip_state "$ip" "$name"
 }
 
@@ -1101,6 +1158,8 @@ sync_awg() {
   install_awg_base
   ensure_awg_port_saved
   ensure_awg_port_not_in_xray
+  force_awg_ipv4_only_defaults
+  strip_awg_ipv6_server_rules
   scope_awg_masquerade_to_tunnel_subnet "$nic"
   cleanup_legacy_awg_masquerade_rules "$nic"
 
@@ -1144,6 +1203,7 @@ sync_awg() {
   sync_awg_snat "$nic"
   refresh_awg_artifacts_into_state
   ensure_awg_healthy
+  cleanup_awg_ipv6_runtime_rules "$nic"
   cleanup_legacy_awg_masquerade_rules "$nic"
   save_iptables
   write_awg_summary
