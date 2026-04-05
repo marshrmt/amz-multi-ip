@@ -833,8 +833,9 @@ awg_remove_name() {
   vpn_ip="$(extract_awg_vpn_ip_from_conf "$conf_path")"
 
   if [[ -n "$vpn_ip" && -n "$public_ip" ]]; then
-    iptables -t nat -C POSTROUTING -s "${vpn_ip}/32" -o "$nic" -j SNAT --to-source "$public_ip" 2>/dev/null \
-      && iptables -t nat -D POSTROUTING -s "${vpn_ip}/32" -o "$nic" -j SNAT --to-source "$public_ip" || true
+    while iptables -t nat -C POSTROUTING -s "${vpn_ip}/32" -o "$nic" -j SNAT --to-source "$public_ip" 2>/dev/null; do
+      iptables -t nat -D POSTROUTING -s "${vpn_ip}/32" -o "$nic" -j SNAT --to-source "$public_ip" || true
+    done
   fi
 
   awg_remove_peer_best_effort "$name"
@@ -857,8 +858,9 @@ awg_remove_ip() {
   vpn_ip="$(jq -r --arg ip "$ip" '.awg.clients[$ip].vpn_ip // ""' "$STATE_FILE")"
 
   if [[ -n "$vpn_ip" ]]; then
-    iptables -t nat -C POSTROUTING -s "${vpn_ip}/32" -o "$nic" -j SNAT --to-source "$ip" 2>/dev/null \
-      && iptables -t nat -D POSTROUTING -s "${vpn_ip}/32" -o "$nic" -j SNAT --to-source "$ip" || true
+    while iptables -t nat -C POSTROUTING -s "${vpn_ip}/32" -o "$nic" -j SNAT --to-source "$ip" 2>/dev/null; do
+      iptables -t nat -D POSTROUTING -s "${vpn_ip}/32" -o "$nic" -j SNAT --to-source "$ip" || true
+    done
   fi
 
   [[ -n "$name" ]] && awg_remove_peer_best_effort "$name"
@@ -899,8 +901,12 @@ sync_awg_snat() {
 
     [[ -n "$vpn_ip" && "$vpn_ip" != "null" ]] || continue
 
-    iptables -t nat -C POSTROUTING -s "${vpn_ip}/32" -o "$nic" -j SNAT --to-source "$public_ip" 2>/dev/null \
-      || iptables -t nat -A POSTROUTING -s "${vpn_ip}/32" -o "$nic" -j SNAT --to-source "$public_ip"
+    while iptables -t nat -C POSTROUTING -s "${vpn_ip}/32" -o "$nic" -j SNAT --to-source "$public_ip" 2>/dev/null; do
+      iptables -t nat -D POSTROUTING -s "${vpn_ip}/32" -o "$nic" -j SNAT --to-source "$public_ip" || true
+    done
+
+    # Specific per-client SNAT must stay above the generic MASQUERADE from awg-quick.
+    iptables -t nat -I POSTROUTING 1 -s "${vpn_ip}/32" -o "$nic" -j SNAT --to-source "$public_ip"
   done
 
   save_iptables
