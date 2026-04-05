@@ -244,8 +244,8 @@ render_server_config() {
     }
 
     # PostUp/PostDown rules for routing
-    local postup="iptables -I FORWARD -i %i -j ACCEPT; iptables -t nat -A POSTROUTING -o ${nic} -j MASQUERADE"
-    local postdown="iptables -D FORWARD -i %i -j ACCEPT; iptables -t nat -D POSTROUTING -o ${nic} -j MASQUERADE"
+    local postup="iptables -I FORWARD -i %i -j ACCEPT; iptables -t nat -A POSTROUTING -s ${AWG_TUNNEL_SUBNET} -o ${nic} -j MASQUERADE"
+    local postdown="iptables -D FORWARD -i %i -j ACCEPT; iptables -t nat -D POSTROUTING -s ${AWG_TUNNEL_SUBNET} -o ${nic} -j MASQUERADE"
 
     # IPv6 rules if not disabled
     if [[ "${DISABLE_IPV6:-1}" -eq 0 ]]; then

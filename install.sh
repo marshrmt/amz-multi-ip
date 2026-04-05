@@ -660,6 +660,10 @@ get_awg_port() {
   awk -F= '/^export AWG_PORT=/{gsub(/'\''|"/,"",$2); print $2}' "${AWG_DIR}/awgsetup_cfg.init" | tail -n1
 }
 
+get_awg_tunnel_subnet() {
+  awk -F= '/^export AWG_TUNNEL_SUBNET=/{gsub(/'\''|"/,"",$2); print $2}' "${AWG_DIR}/awgsetup_cfg.init" | tail -n1
+}
+
 ensure_awg_port_saved() {
   local port
   port="$(jq -r '.awg.port // ""' "$STATE_FILE")"
@@ -677,6 +681,21 @@ ensure_awg_port_saved() {
   fi
 
   save_awg_port_to_state "$port"
+}
+
+scope_awg_masquerade_to_tunnel_subnet() {
+  local nic="$1"
+  local subnet
+
+  [[ -f "$AWG_SERVER_CONF" ]] || return 0
+
+  subnet="$(get_awg_tunnel_subnet)"
+  [[ -n "$subnet" ]] || return 0
+
+  sed -i \
+    -e "s#iptables -t nat -A POSTROUTING -o ${nic} -j MASQUERADE#iptables -t nat -A POSTROUTING -s ${subnet} -o ${nic} -j MASQUERADE#g" \
+    -e "s#iptables -t nat -D POSTROUTING -o ${nic} -j MASQUERADE#iptables -t nat -D POSTROUTING -s ${subnet} -o ${nic} -j MASQUERADE#g" \
+    "$AWG_SERVER_CONF"
 }
 
 awg_has_ip() {
@@ -1066,6 +1085,7 @@ sync_awg() {
   install_awg_base
   ensure_awg_port_saved
   ensure_awg_port_not_in_xray
+  scope_awg_masquerade_to_tunnel_subnet "$nic"
 
   for ip in "${IPS[@]}"; do
     if awg_has_ip "$ip"; then
