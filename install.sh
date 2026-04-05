@@ -192,6 +192,7 @@ ensure_xray_installed() {
 
 ensure_xray_keys() {
   local priv pub out tmp
+
   priv="$(jq -r '.xray.private_key // ""' "$STATE_FILE")"
   pub="$(jq -r '.xray.public_key // ""' "$STATE_FILE")"
 
@@ -199,9 +200,14 @@ ensure_xray_keys() {
     return
   fi
 
-  out="$(xray x25519)"
-  priv="$(awk '/Private key:/ {print $3}' <<<"$out")"
-  pub="$(awk '/Public key:/ {print $3}' <<<"$out")"
+  out="$(xray x25519 2>/dev/null || true)"
+
+  priv="$(printf '%s\n' "$out" | sed -n 's/.*Private key: *//p' | head -n1 | tr -d '\r')"
+  pub="$(printf '%s\n' "$out" | sed -n 's/.*Public key: *//p' | head -n1 | tr -d '\r')"
+
+  if [[ -z "$priv" || -z "$pub" ]]; then
+    err "Failed to parse xray x25519 output. Raw output was: $out"
+  fi
 
   tmp="$(mktemp)"
   jq --arg priv "$priv" --arg pub "$pub" \
