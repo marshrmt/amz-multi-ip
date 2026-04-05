@@ -613,6 +613,37 @@ awg_name_exists() {
     || [[ -f "${AWG_DIR}/${name}.vpnuri" ]]
 }
 
+list_awg_server_client_names() {
+  [[ -f "$AWG_SERVER_CONF" ]] || return 0
+  grep '^#_Name = ' "$AWG_SERVER_CONF" | sed 's/^#_Name = //' || true
+}
+
+awg_ip_from_name() {
+  local name="$1"
+  local ip
+
+  [[ "$name" == awg-* ]] || return 0
+  ip="${name#awg-}"
+  ip="${ip//-/.}"
+
+  if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    printf '%s\n' "$ip"
+  fi
+}
+
+ip_is_wanted() {
+  local ip="$1"
+  local wanted
+
+  for wanted in "${IPS[@]}"; do
+    if [[ "$wanted" == "$ip" ]]; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
 find_awg_conf_for_name() {
   local name="$1"
   local conf
@@ -779,6 +810,44 @@ awg_remove_peer_best_effort() {
   fi
 }
 
+awg_drop_ip_from_state() {
+  local ip="$1"
+  local tmp
+
+  if ! jq -e --arg ip "$ip" '.awg.clients[$ip] != null' "$STATE_FILE" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  tmp="$(mktemp)"
+  jq --arg ip "$ip" 'del(.awg.clients[$ip])' "$STATE_FILE" > "$tmp"
+  mv "$tmp" "$STATE_FILE"
+}
+
+awg_remove_name() {
+  local nic="$1"
+  local name="$2"
+  local public_ip vpn_ip conf_path
+
+  public_ip="$(awg_ip_from_name "$name")"
+  conf_path="$(find_awg_conf_for_name "$name")"
+  vpn_ip="$(extract_awg_vpn_ip_from_conf "$conf_path")"
+
+  if [[ -n "$vpn_ip" && -n "$public_ip" ]]; then
+    iptables -t nat -C POSTROUTING -s "${vpn_ip}/32" -o "$nic" -j SNAT --to-source "$public_ip" 2>/dev/null \
+      && iptables -t nat -D POSTROUTING -s "${vpn_ip}/32" -o "$nic" -j SNAT --to-source "$public_ip" || true
+  fi
+
+  awg_remove_peer_best_effort "$name"
+  rm -f "${AWG_DIR}/${name}.conf" "${AWG_DIR}/${name}.png" "${AWG_DIR}/${name}.vpnuri"
+  rm -f "${OUT_DIR}/${name}.conf" "${OUT_DIR}/${name}.vpnuri.txt"
+
+  if [[ -n "$public_ip" ]]; then
+    awg_drop_ip_from_state "$public_ip"
+  fi
+
+  log "Removed AWG client ${name}"
+}
+
 awg_remove_ip() {
   local nic="$1"
   local ip="$2"
@@ -800,6 +869,23 @@ awg_remove_ip() {
   mv "$tmp" "$STATE_FILE"
 
   log "Removed AWG client for ${ip}"
+}
+
+prune_unwanted_awg_server_clients() {
+  local nic="$1"
+  local name public_ip
+
+  while IFS= read -r name; do
+    [[ -z "$name" ]] && continue
+    public_ip="$(awg_ip_from_name "$name")"
+
+    [[ -n "$public_ip" ]] || continue
+
+    if ! ip_is_wanted "$public_ip"; then
+      awg_remove_name "$nic" "$name"
+      remove_ip_alias "$nic" "$public_ip"
+    fi
+  done < <(list_awg_server_client_names)
 }
 
 sync_awg_snat() {
@@ -913,6 +999,8 @@ sync_awg() {
   done
 
   if [[ "$PRUNE" == "1" ]]; then
+    prune_unwanted_awg_server_clients "$nic"
+
     while IFS= read -r ip; do
       [[ -z "$ip" ]] && continue
       keep=0
