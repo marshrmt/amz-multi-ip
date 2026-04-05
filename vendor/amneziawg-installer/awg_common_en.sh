@@ -676,7 +676,7 @@ generate_vpn_uri() {
         $outer .= qq("port":"$port","protocol_version":"2",);
         $outer .= qq("transport_proto":"udp"\},"container":"amnezia-awg"\}],);
         $outer .= qq("defaultContainer":"amnezia-awg",);
-        $outer .= qq("description":"AWG Server",);
+        $outer .= qq("description":"$ep",);
         $outer .= qq("dns1":"1.1.1.1","dns2":"1.0.0.1",);
         $outer .= qq("hostName":"$ep"});
 

@@ -617,6 +617,7 @@ install_awg_base() {
 
   if [[ -x "${AWG_DIR}/manage_amneziawg.sh" ]]; then
     log "AWG installer already present"
+    refresh_awg_vendor_scripts
     return
   fi
 
@@ -654,6 +655,23 @@ install_awg_base() {
   actual_port="$(get_awg_port)"
   [[ -n "$actual_port" ]] || err "Could not detect AWG port after installation"
   save_awg_port_to_state "$actual_port"
+  refresh_awg_vendor_scripts
+}
+
+refresh_awg_vendor_scripts() {
+  [[ -d "$AWG_DIR" ]] || return 0
+
+  curl -fsSL "${AWG_VENDOR_BASE_URL}/awg_common_en.sh" -o "${AWG_DIR}/awg_common.sh" || {
+    warn "Could not refresh awg_common.sh from repo"
+    return 0
+  }
+  chmod 700 "${AWG_DIR}/awg_common.sh" || true
+
+  curl -fsSL "${AWG_VENDOR_BASE_URL}/manage_amneziawg_en.sh" -o "${AWG_DIR}/manage_amneziawg.sh" || {
+    warn "Could not refresh manage_amneziawg.sh from repo"
+    return 0
+  }
+  chmod 700 "${AWG_DIR}/manage_amneziawg.sh" || true
 }
 
 get_awg_port() {
