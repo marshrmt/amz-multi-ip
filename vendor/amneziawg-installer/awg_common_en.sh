@@ -306,7 +306,7 @@ render_client_config() {
     load_awg_params || return 1
 
     local conf_file="$AWG_DIR/${name}.conf"
-    local allowed_ips="${ALLOWED_IPS:-0.0.0.0/0}"
+    local allowed_ips="${ALLOWED_IPS:-0.0.0.0/0,::/0}"
 
     local tmpfile
     tmpfile=$(awg_mktemp) || { log_error "mktemp failed"; return 1; }
@@ -636,7 +636,7 @@ generate_vpn_uri() {
         endpoint_override="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}.${BASH_REMATCH[4]}"
         endpoint="$endpoint_override"
     fi
-    allowed_ips=$(grep -oP 'AllowedIPs\s*=\s*\K.+' "$conf_file" | tr -d ' ') || allowed_ips="0.0.0.0/0"
+    allowed_ips=$(grep -oP 'AllowedIPs\s*=\s*\K.+' "$conf_file" | tr -d ' ') || allowed_ips="0.0.0.0/0,::/0"
 
     local vpn_uri perl_err
     perl_err=$(awg_mktemp) || perl_err="/tmp/awg_perl_err.$$"
@@ -857,7 +857,7 @@ regenerate_client() {
     }
 
     # Preserve user settings from current .conf (modified via modify command)
-    local current_dns="1.1.1.1" current_keepalive="33" current_allowed_ips="${ALLOWED_IPS:-0.0.0.0/0}" current_endpoint=""
+    local current_dns="1.1.1.1" current_keepalive="33" current_allowed_ips="${ALLOWED_IPS:-0.0.0.0/0,::/0}" current_endpoint=""
     if [[ -f "$AWG_DIR/${name}.conf" ]]; then
         local _v
         _v=$(sed -n 's/^DNS[ \t]*=[ \t]*//p' "$AWG_DIR/${name}.conf" | tr -d '[:space:]')
