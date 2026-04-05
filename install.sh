@@ -698,6 +698,24 @@ scope_awg_masquerade_to_tunnel_subnet() {
     "$AWG_SERVER_CONF"
 }
 
+cleanup_legacy_awg_masquerade_rules() {
+  local nic="$1"
+  local subnet
+
+  subnet="$(get_awg_tunnel_subnet)"
+  [[ -n "$subnet" ]] || return 0
+
+  while iptables -t nat -C POSTROUTING -o "$nic" -j MASQUERADE 2>/dev/null; do
+    iptables -t nat -D POSTROUTING -o "$nic" -j MASQUERADE || true
+  done
+
+  while iptables -t nat -C POSTROUTING -s "$subnet" -o "$nic" -j MASQUERADE 2>/dev/null; do
+    iptables -t nat -D POSTROUTING -s "$subnet" -o "$nic" -j MASQUERADE || true
+  done
+
+  iptables -t nat -A POSTROUTING -s "$subnet" -o "$nic" -j MASQUERADE
+}
+
 awg_has_ip() {
   local ip="$1"
   jq -e --arg ip "$ip" '.awg.clients[$ip] != null' "$STATE_FILE" >/dev/null
@@ -1086,6 +1104,7 @@ sync_awg() {
   ensure_awg_port_saved
   ensure_awg_port_not_in_xray
   scope_awg_masquerade_to_tunnel_subnet "$nic"
+  cleanup_legacy_awg_masquerade_rules "$nic"
 
   for ip in "${IPS[@]}"; do
     if awg_has_ip "$ip"; then
