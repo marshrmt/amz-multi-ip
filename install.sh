@@ -202,8 +202,8 @@ ensure_xray_keys() {
 
   out="$(xray x25519 2>/dev/null || true)"
 
-  priv="$(printf '%s\n' "$out" | sed -n 's/.*Private key: *//p' | head -n1 | tr -d '\r')"
-  pub="$(printf '%s\n' "$out" | sed -n 's/.*Public key: *//p' | head -n1 | tr -d '\r')"
+  priv="$(printf '%s\n' "$out" | sed -n 's/^PrivateKey: *//p' | head -n1 | tr -d '\r')"
+  pub="$(printf '%s\n' "$out" | sed -n 's/^Password (PublicKey): *//p' | head -n1 | tr -d '\r')"
 
   if [[ -z "$priv" || -z "$pub" ]]; then
     err "Failed to parse xray x25519 output. Raw output was: $out"
