@@ -171,7 +171,7 @@ port_is_in_use_tcp() {
 
 port_is_in_use_udp() {
   local port="$1"
-  ss -lunH 2>/dev/null | awk '{print $5}' | grep -Eq "(^|:)$port$"
+  ss -lunH 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)$port$"
 }
 
 port_is_in_use_anywhere() {
@@ -854,7 +854,7 @@ ensure_awg_healthy() {
     systemctl restart awg-quick@awg0 >/dev/null 2>&1 || true
     sleep 1
 
-    if systemctl is-active --quiet awg-quick@awg0 && ss -lunH 2>/dev/null | awk '{print $5}' | grep -Eq "(^|:)$port$"; then
+    if systemctl is-active --quiet awg-quick@awg0 && ss -lunH 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)$port$"; then
       return 0
     fi
 
