@@ -844,7 +844,7 @@ refresh_awg_artifacts_into_state() {
 }
 
 ensure_awg_healthy() {
-  local port attempt
+  local port attempt active_port
 
   port="$(jq -r '.awg.port // ""' "$STATE_FILE")"
   [[ -n "$port" ]] || err "AWG port is empty in state"
@@ -854,16 +854,23 @@ ensure_awg_healthy() {
     systemctl restart awg-quick@awg0 >/dev/null 2>&1 || true
     sleep 1
 
-    if systemctl is-active --quiet awg-quick@awg0 && ss -lunH 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)$port$"; then
+    active_port="$(
+      awg show awg0 2>/dev/null \
+        | sed -n 's/^[[:space:]]*listening port:[[:space:]]*//p' \
+        | head -n1 \
+        | tr -d '\r'
+    )"
+
+    if systemctl is-active --quiet awg-quick@awg0 && [[ "$active_port" == "$port" ]]; then
       return 0
     fi
 
-    warn "AWG restart attempt ${attempt} did not make UDP port ${port} listen"
+    warn "AWG restart attempt ${attempt} did not confirm listening port ${port} (actual: ${active_port:-unknown})"
   done
 
   systemctl status awg-quick@awg0 --no-pager -l || true
   awg show || true
-  err "AWG did not start correctly or UDP port ${port} is not listening"
+  err "AWG did not start correctly or listening port ${port} was not confirmed"
 }
 
 write_awg_summary() {
