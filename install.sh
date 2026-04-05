@@ -1025,8 +1025,6 @@ sync_awg_snat() {
     # Specific per-client SNAT must stay above the generic MASQUERADE from awg-quick.
     iptables -t nat -I POSTROUTING 1 -s "${vpn_ip}/32" -o "$nic" -j SNAT --to-source "$public_ip"
   done
-
-  save_iptables
 }
 
 refresh_awg_artifacts_into_state() {
@@ -1146,6 +1144,8 @@ sync_awg() {
   sync_awg_snat "$nic"
   refresh_awg_artifacts_into_state
   ensure_awg_healthy
+  cleanup_legacy_awg_masquerade_rules "$nic"
+  save_iptables
   write_awg_summary
 
   log "AWG done"
