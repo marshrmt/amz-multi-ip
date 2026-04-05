@@ -15,16 +15,23 @@ XRAY_DIR="/usr/local/etc/xray"
 XRAY_CONFIG="${XRAY_DIR}/config.json"
 XRAY_SERVICE="xray"
 
-AWG_BRANCH="main"
+AWG_DIR="/root/awg"
+AWG_SERVER_CONF="/etc/amnezia/amneziawg/awg0.conf"
+
+REPO_RAW_BASE="${REPO_RAW_BASE:-https://raw.githubusercontent.com/marshrmt/amz-multi-ip/main}"
+XRAY_INSTALL_SCRIPT_URL="${REPO_RAW_BASE}/vendor/xray-install/install-release.sh"
+AWG_VENDOR_BASE_URL="${REPO_RAW_BASE}/vendor/amneziawg-installer"
+AWG_INSTALL_SCRIPT_URL="${AWG_VENDOR_BASE_URL}/install_amneziawg_en.sh"
 
 usage() {
   cat <<'EOF'
 Usage:
   bash install.sh --proto xray --ips 1.2.3.4,1.2.3.5 [--sni video.yahoo.com] [--prune]
   bash install.sh --proto awg  --ips 1.2.3.4,1.2.3.5 [--prune]
+  bash install.sh --proto both --ips 1.2.3.4,1.2.3.5 [--sni video.yahoo.com] [--prune]
 
 Args:
-  --proto   awg | xray
+  --proto   awg | xray | both
   --ips     comma-separated public IPv4 list
   --sni     Xray Reality SNI/domain (default: video.yahoo.com)
   --prune   remove configs for IPs missing from current list
@@ -90,7 +97,7 @@ parse_args() {
     esac
   done
 
-  [[ "$PROTO" == "xray" || "$PROTO" == "awg" ]] || err "--proto must be xray or awg"
+  [[ "$PROTO" == "xray" || "$PROTO" == "awg" || "$PROTO" == "both" ]] || err "--proto must be xray, awg or both"
   [[ -n "$IPS_CSV" ]] || err "--ips is required"
 }
 
@@ -142,25 +149,82 @@ save_iptables() {
   netfilter-persistent save >/dev/null 2>&1 || iptables-save >/etc/iptables/rules.v4
 }
 
+save_awg_port_to_state() {
+  local port="$1"
+  local tmp
+
+  [[ -n "$port" ]] || err "AWG port is empty"
+
+  tmp="$(mktemp)"
+  jq --arg p "$port" '.awg.port = $p' "$STATE_FILE" > "$tmp"
+  mv "$tmp" "$STATE_FILE"
+}
+
 ########################################
 # XRAY
 ########################################
 
-port_is_in_use_anywhere() {
+port_is_in_use_tcp() {
   local port="$1"
   ss -ltnH 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)$port$"
 }
 
-port_is_in_state() {
+port_is_in_use_udp() {
+  local port="$1"
+  ss -lunH 2>/dev/null | awk '{print $5}' | grep -Eq "(^|:)$port$"
+}
+
+port_is_in_use_anywhere() {
+  local port="$1"
+  port_is_in_use_tcp "$port" || port_is_in_use_udp "$port"
+}
+
+port_is_in_xray_state() {
   local port="$1"
   jq -e --argjson p "$port" '.xray.clients | to_entries[]? | select(.value.port == $p)' "$STATE_FILE" >/dev/null
+}
+
+get_awg_reserved_port() {
+  local port
+
+  port="$(jq -r '.awg.port // ""' "$STATE_FILE")"
+  if [[ -n "$port" ]]; then
+    printf '%s\n' "$port"
+    return
+  fi
+
+  if [[ -f "${AWG_DIR}/awgsetup_cfg.init" ]]; then
+    port="$(get_awg_port)"
+    [[ -n "$port" ]] && printf '%s\n' "$port"
+  fi
+}
+
+port_is_awg_reserved() {
+  local port="$1"
+  [[ -n "$port" && "$port" == "$(get_awg_reserved_port)" ]]
+}
+
+port_is_reserved() {
+  local port="$1"
+  port_is_in_use_anywhere "$port" || port_is_in_xray_state "$port" || port_is_awg_reserved "$port"
+}
+
+ensure_awg_port_not_in_xray() {
+  local port
+
+  port="$(get_awg_reserved_port)"
+  [[ -n "$port" ]] || return 0
+
+  if port_is_in_xray_state "$port"; then
+    err "AWG port ${port} conflicts with an existing Xray port"
+  fi
 }
 
 choose_random_port() {
   local port tries=0
   while :; do
     port="$(rand_port)"
-    if ! port_is_in_use_anywhere "$port" && ! port_is_in_state "$port"; then
+    if ! port_is_reserved "$port"; then
       printf '%s\n' "$port"
       return
     fi
@@ -176,7 +240,10 @@ ensure_xray_installed() {
   fi
 
   log "Installing Xray"
-  bash <(curl -Ls https://github.com/XTLS/Xray-install/raw/main/install-release.sh) install
+  rm -f /root/install-release.sh
+  curl -fsSL "$XRAY_INSTALL_SCRIPT_URL" -o /root/install-release.sh
+  chmod +x /root/install-release.sh
+  bash /root/install-release.sh install
 }
 
 ensure_xray_keys() {
@@ -486,39 +553,52 @@ sync_xray() {
 ########################################
 
 install_awg_base() {
-  if [[ -x /root/awg/manage_amneziawg.sh ]]; then
+  local port actual_port
+
+  if [[ -x "${AWG_DIR}/manage_amneziawg.sh" ]]; then
     log "AWG installer already present"
     return
   fi
 
+  port="$(jq -r '.awg.port // ""' "$STATE_FILE")"
+  [[ -n "$port" ]] || err "AWG port must be reserved before installation"
+
   log "Installing AWG 2.0 base via bivlked installer"
   cd /root
   rm -f install_amneziawg_en.sh
-  wget -O /root/install_amneziawg_en.sh "https://raw.githubusercontent.com/bivlked/amneziawg-installer/${AWG_BRANCH}/install_amneziawg_en.sh"
+  curl -fsSL "$AWG_INSTALL_SCRIPT_URL" -o /root/install_amneziawg_en.sh
   chmod +x /root/install_amneziawg_en.sh
 
-  bash /root/install_amneziawg_en.sh --yes --route-all || true
+  AMZ_AWG_VENDOR_BASE_URL="$AWG_VENDOR_BASE_URL" bash /root/install_amneziawg_en.sh --yes --route-all --port="${port}" || true
 
-  [[ -x /root/awg/manage_amneziawg.sh ]] || err "AWG base install did not finish. If installer rebooted the server, run the same command again."
+  [[ -x "${AWG_DIR}/manage_amneziawg.sh" ]] || err "AWG base install did not finish. If installer rebooted the server, run the same command again."
+
+  actual_port="$(get_awg_port)"
+  [[ -n "$actual_port" ]] || err "Could not detect AWG port after installation"
+  save_awg_port_to_state "$actual_port"
 }
 
 get_awg_port() {
-  awk -F= '/^export AWG_PORT=/{gsub(/'\''|"/,"",$2); print $2}' /root/awg/awgsetup_cfg.init | tail -n1
+  awk -F= '/^export AWG_PORT=/{gsub(/'\''|"/,"",$2); print $2}' "${AWG_DIR}/awgsetup_cfg.init" | tail -n1
 }
 
 ensure_awg_port_saved() {
-  local port tmp
+  local port
   port="$(jq -r '.awg.port // ""' "$STATE_FILE")"
   if [[ -n "$port" ]]; then
     return
   fi
 
-  port="$(get_awg_port)"
-  [[ -n "$port" ]] || err "Could not detect AWG port"
+  if [[ -f "${AWG_DIR}/awgsetup_cfg.init" ]]; then
+    port="$(get_awg_port)"
+  fi
 
-  tmp="$(mktemp)"
-  jq --arg p "$port" '.awg.port = $p' "$STATE_FILE" > "$tmp"
-  mv "$tmp" "$STATE_FILE"
+  if [[ -z "$port" ]]; then
+    port="$(choose_random_port)"
+    log "Reserved AWG port ${port}/udp"
+  fi
+
+  save_awg_port_to_state "$port"
 }
 
 awg_has_ip() {
@@ -526,30 +606,79 @@ awg_has_ip() {
   jq -e --arg ip "$ip" '.awg.clients[$ip] != null' "$STATE_FILE" >/dev/null
 }
 
+awg_name_exists() {
+  local name="$1"
+  grep -qxF "#_Name = ${name}" "$AWG_SERVER_CONF" 2>/dev/null \
+    || [[ -f "${AWG_DIR}/${name}.conf" ]] \
+    || [[ -f "${AWG_DIR}/${name}.vpnuri" ]]
+}
+
+find_awg_conf_for_name() {
+  local name="$1"
+  local conf
+
+  conf="${AWG_DIR}/${name}.conf"
+  if [[ -f "$conf" ]]; then
+    printf '%s\n' "$conf"
+    return
+  fi
+
+  find "$AWG_DIR" -maxdepth 3 -type f -name "${name}.conf" | head -n1 || true
+}
+
+extract_awg_vpn_ip_from_conf() {
+  local conf_path="$1"
+
+  [[ -n "$conf_path" && -f "$conf_path" ]] || return 0
+  grep -oPm1 '^\s*Address\s*=\s*\K[0-9.]+' "$conf_path" || true
+}
+
+ensure_awg_artifacts_for_name() {
+  local name="$1"
+  local conf_path vpnuri_path
+
+  conf_path="$(find_awg_conf_for_name "$name")"
+  vpnuri_path="${AWG_DIR}/${name}.vpnuri"
+
+  if [[ -n "$conf_path" && -f "$conf_path" && -f "$vpnuri_path" ]]; then
+    return
+  fi
+
+  bash "${AWG_DIR}/manage_amneziawg.sh" regen "$name" >/dev/null 2>&1 || true
+}
+
 collect_awg_artifacts_for_name() {
   local name="$1"
-  local conf vpnuri vpnuri_text
+  local conf vpnuri vpnuri_text vpn_ip
 
-  conf="$(find /root/awg -maxdepth 3 -type f -name "${name}.conf" | head -n1 || true)"
-  vpnuri="/root/awg/${name}.vpnuri"
+  ensure_awg_artifacts_for_name "$name"
+
+  conf="$(find_awg_conf_for_name "$name")"
+  vpnuri="${AWG_DIR}/${name}.vpnuri"
   vpnuri_text=""
   [[ -f "$vpnuri" ]] && vpnuri_text="$(cat "$vpnuri")"
+  vpn_ip="$(extract_awg_vpn_ip_from_conf "$conf")"
 
   jq -n \
     --arg conf "$conf" \
     --arg vpnuri_path "$vpnuri" \
     --arg vpnuri "$vpnuri_text" \
-    '{conf_path:$conf, vpnuri_path:$vpnuri_path, vpnuri:$vpnuri}'
+    --arg vpn_ip "$vpn_ip" \
+    '{conf_path:$conf, vpnuri_path:$vpnuri_path, vpnuri:$vpnuri, vpn_ip:$vpn_ip}'
 }
 
-collect_awg_stats_json() {
-  bash /root/awg/manage_amneziawg.sh stats --json > "${STATE_DIR}/awg-stats.json"
-}
-
-find_awg_vpn_ip_for_name() {
+validate_awg_artifacts_json() {
   local name="$1"
-  collect_awg_stats_json
-  jq -r --arg name "$name" '.[] | select(.name == $name) | .ip' "${STATE_DIR}/awg-stats.json" | head -n1
+  local conf_json="$2"
+  local conf_path vpnuri vpn_ip
+
+  conf_path="$(jq -r '.conf_path // ""' <<<"$conf_json")"
+  vpnuri="$(jq -r '.vpnuri // ""' <<<"$conf_json")"
+  vpn_ip="$(jq -r '.vpn_ip // ""' <<<"$conf_json")"
+
+  [[ -n "$conf_path" && -f "$conf_path" ]] || err "Could not find AWG config file for ${name}"
+  [[ -n "$vpnuri" ]] || err "Could not find AWG vpnuri for ${name}"
+  [[ -n "$vpn_ip" ]] || err "Could not parse AWG VPN IP for ${name}"
 }
 
 write_awg_output_files() {
@@ -564,28 +693,22 @@ write_awg_output_files() {
   [[ -n "$vpnuri" ]] && printf '%s\n' "$vpnuri" > "${OUT_DIR}/${name}.vpnuri.txt" || true
 }
 
-awg_add_ip() {
+upsert_awg_state_for_ip() {
   local ip="$1"
-  local name conf_json vpn_ip tmp port
+  local name="$2"
+  local conf_json="$3"
+  local tmp
 
-  name="awg-${ip//./-}"
-  port="$(jq -r '.awg.port' "$STATE_FILE")"
-
-  bash /root/awg/manage_amneziawg.sh add "$name" || true
-  bash /root/awg/manage_amneziawg.sh modify "$name" Endpoint "${ip}:${port}" || true
-
-  vpn_ip="$(find_awg_vpn_ip_for_name "$name")"
-  conf_json="$(collect_awg_artifacts_for_name "$name")"
+  [[ -n "$conf_json" ]] || err "Could not collect AWG artifacts for ${name}"
 
   tmp="$(mktemp)"
   jq --arg ip "$ip" \
      --arg name "$name" \
-     --arg vpn_ip "$vpn_ip" \
      --argjson meta "$conf_json" \
      '
      .awg.clients[$ip] = {
        "name": $name,
-       "vpn_ip": $vpn_ip,
+       "vpn_ip": $meta.vpn_ip,
        "conf_path": $meta.conf_path,
        "vpnuri_path": $meta.vpnuri_path,
        "vpnuri": $meta.vpnuri
@@ -594,13 +717,63 @@ awg_add_ip() {
   mv "$tmp" "$STATE_FILE"
 
   write_awg_output_files "$ip"
+}
+
+refresh_awg_ip_state() {
+  local ip="$1"
+  local name="$2"
+  local conf_json
+
+  conf_json="$(collect_awg_artifacts_for_name "$name")"
+  validate_awg_artifacts_json "$name" "$conf_json"
+  upsert_awg_state_for_ip "$ip" "$name" "$conf_json"
+}
+
+awg_add_ip() {
+  local ip="$1"
+  local name port
+
+  name="awg-${ip//./-}"
+  port="$(jq -r '.awg.port' "$STATE_FILE")"
+
+  bash "${AWG_DIR}/manage_amneziawg.sh" add "$name"
+  bash "${AWG_DIR}/manage_amneziawg.sh" modify "$name" Endpoint "${ip}:${port}" || true
+
+  refresh_awg_ip_state "$ip" "$name"
   log "Added AWG client for ${ip}"
+}
+
+awg_import_existing_ip() {
+  local ip="$1"
+  local name port
+
+  name="awg-${ip//./-}"
+  port="$(jq -r '.awg.port' "$STATE_FILE")"
+
+  bash "${AWG_DIR}/manage_amneziawg.sh" modify "$name" Endpoint "${ip}:${port}" || true
+  refresh_awg_ip_state "$ip" "$name"
+  log "Imported existing AWG client for ${ip}"
+}
+
+awg_refresh_existing_ip() {
+  local ip="$1"
+  local name port
+
+  name="$(jq -r --arg ip "$ip" '.awg.clients[$ip].name // ""' "$STATE_FILE")"
+  [[ -n "$name" ]] || name="awg-${ip//./-}"
+  port="$(jq -r '.awg.port' "$STATE_FILE")"
+
+  if awg_name_exists "$name"; then
+    bash "${AWG_DIR}/manage_amneziawg.sh" modify "$name" Endpoint "${ip}:${port}" || true
+  fi
+
+  refresh_awg_ip_state "$ip" "$name"
 }
 
 awg_remove_peer_best_effort() {
   local name="$1"
-  if bash /root/awg/manage_amneziawg.sh help 2>/dev/null | grep -qi 'remove'; then
-    bash /root/awg/manage_amneziawg.sh remove "$name" || true
+  if bash "${AWG_DIR}/manage_amneziawg.sh" help 2>/dev/null | grep -qi 'remove'; then
+    bash "${AWG_DIR}/manage_amneziawg.sh" remove "$name" || true
   else
     warn "AWG remove command not detected in upstream manager, only local state/files will be cleaned"
   fi
@@ -659,7 +832,8 @@ refresh_awg_artifacts_into_state() {
     jq --arg ip "$ip" \
        --argjson meta "$conf_json" \
        '
-       .awg.clients[$ip].conf_path = $meta.conf_path
+       .awg.clients[$ip].vpn_ip = $meta.vpn_ip
+       | .awg.clients[$ip].conf_path = $meta.conf_path
        | .awg.clients[$ip].vpnuri_path = $meta.vpnuri_path
        | .awg.clients[$ip].vpnuri = $meta.vpnuri
        ' "$STATE_FILE" > "$tmp"
@@ -706,18 +880,29 @@ write_awg_summary() {
 
 sync_awg() {
   local nic="$1"
-  local ip wanted keep
+  local ip wanted keep name
 
+  ensure_awg_port_saved
+  ensure_awg_port_not_in_xray
   install_awg_base
   ensure_awg_port_saved
+  ensure_awg_port_not_in_xray
 
   for ip in "${IPS[@]}"; do
     if awg_has_ip "$ip"; then
       log "AWG already exists for ${ip}, skipping create"
-      write_awg_output_files "$ip"
-    else
-      awg_add_ip "$ip"
+      awg_refresh_existing_ip "$ip"
+      continue
     fi
+
+    name="awg-${ip//./-}"
+    if awg_name_exists "$name"; then
+      log "AWG already exists on server for ${ip}, importing"
+      awg_import_existing_ip "$ip"
+      continue
+    fi
+
+    awg_add_ip "$ip"
   done
 
   if [[ "$PRUNE" == "1" ]]; then
@@ -750,24 +935,55 @@ sync_awg() {
 # OUTPUT
 ########################################
 
-print_console_configs() {
+print_selected_xray_configs() {
+  local ip value printed=0
+
+  for ip in "${IPS[@]}"; do
+    value="$(jq -r --arg ip "$ip" '.xray.clients[$ip].url // ""' "$STATE_FILE")"
+
+    [[ -n "$value" ]] || continue
+
+    if [[ "$printed" -eq 1 ]]; then
+      printf '===\n'
+    fi
+
+    printf '%s\n%s\n' "$ip" "$value"
+    printed=1
+  done
+}
+
+print_selected_awg_configs() {
+  local ip value printed=0
+
+  for ip in "${IPS[@]}"; do
+    value="$(jq -r --arg ip "$ip" '.awg.clients[$ip].vpnuri // ""' "$STATE_FILE")"
+
+    [[ -n "$value" ]] || continue
+
+    if [[ "$printed" -eq 1 ]]; then
+      printf '===\n'
+    fi
+
+    printf '%s\n%s\n' "$ip" "$value"
+    printed=1
+  done
+}
+
+print_selected_console_configs() {
   if [[ "$PROTO" == "xray" ]]; then
-    jq -r '
-      .xray.clients
-      | to_entries
-      | sort_by(.key)
-      | .[]
-      | .key, .value.url, "==="
-    ' "$STATE_FILE"
-  else
-    jq -r '
-      .awg.clients
-      | to_entries
-      | sort_by(.key)
-      | .[]
-      | .key, (.value.vpnuri // ""), "==="
-    ' "$STATE_FILE"
+    print_selected_xray_configs
+    return
   fi
+
+  if [[ "$PROTO" == "awg" ]]; then
+    print_selected_awg_configs
+    return
+  fi
+
+  printf '[xray]\n'
+  print_selected_xray_configs
+  printf '\n[awg]\n'
+  print_selected_awg_configs
 }
 
 ########################################
@@ -789,14 +1005,19 @@ main() {
   persist_sysctl_basic
   ensure_ip_aliases "$nic" "${IPS[@]}"
 
-  if [[ "$PROTO" == "xray" ]]; then
+  if [[ "$PROTO" == "both" ]]; then
+    ensure_awg_port_saved
+    sync_xray
+    sync_awg "$nic"
+  elif [[ "$PROTO" == "xray" ]]; then
     sync_xray
   else
+    ensure_awg_port_saved
     sync_awg "$nic"
   fi
 
   echo
-  print_console_configs
+  print_selected_console_configs
 }
 
 main "$@"
