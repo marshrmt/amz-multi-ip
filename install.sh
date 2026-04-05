@@ -22,6 +22,9 @@ REPO_RAW_BASE="${REPO_RAW_BASE:-https://raw.githubusercontent.com/marshrmt/amz-m
 XRAY_INSTALL_SCRIPT_URL="${REPO_RAW_BASE}/vendor/xray-install/install-release.sh"
 AWG_VENDOR_BASE_URL="${REPO_RAW_BASE}/vendor/amneziawg-installer"
 AWG_INSTALL_SCRIPT_URL="${AWG_VENDOR_BASE_URL}/install_amneziawg_en.sh"
+AWG_SETUP_STATE_FILE="${AWG_DIR}/setup_state"
+
+SCRIPT_ARGS=()
 
 usage() {
   cat <<'EOF'
@@ -41,6 +44,53 @@ EOF
 log()  { echo -e "\033[1;32m[+]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[!]\033[0m $*"; }
 err()  { echo -e "\033[1;31m[-]\033[0m $*" >&2; exit 1; }
+
+format_rerun_command() {
+  local args=""
+
+  if [[ ${#SCRIPT_ARGS[@]} -gt 0 ]]; then
+    printf -v args '%q ' "${SCRIPT_ARGS[@]}"
+    args="${args% }"
+  fi
+
+  printf 'curl -fsSL %s/install.sh | bash -s -- %s' "$REPO_RAW_BASE" "$args"
+}
+
+get_awg_resume_step() {
+  local step=""
+
+  [[ -f "$AWG_SETUP_STATE_FILE" ]] || return 1
+  step="$(tr -d '\r\n[:space:]' < "$AWG_SETUP_STATE_FILE" 2>/dev/null || true)"
+  [[ "$step" =~ ^[0-9]+$ ]] || return 1
+  (( step > 0 && step < 99 )) || return 1
+
+  printf '%s\n' "$step"
+}
+
+print_partial_xray_configs_if_any() {
+  if jq -e '.xray.clients | length > 0' "$STATE_FILE" >/dev/null 2>&1; then
+    echo
+    printf '[xray]\n'
+    print_selected_xray_configs
+  fi
+}
+
+exit_awg_reboot_required() {
+  local step="$1"
+
+  warn "AWG installation requires a reboot and paused at step ${step}."
+
+  if [[ "$PROTO" == "both" ]]; then
+    log "Xray is already configured. After reboot, rerun the same command to continue AWG setup."
+    print_partial_xray_configs_if_any
+  else
+    log "After reboot, rerun the same command to continue AWG setup."
+  fi
+
+  echo
+  printf 'Reboot required. Resume with:\n%s\n' "$(format_rerun_command)"
+  exit 0
+}
 
 require_root() {
   [[ $EUID -eq 0 ]] || err "Run as root."
@@ -563,7 +613,7 @@ sync_xray() {
 ########################################
 
 install_awg_base() {
-  local port actual_port
+  local port actual_port installer_rc=0 resume_step=""
 
   if [[ -x "${AWG_DIR}/manage_amneziawg.sh" ]]; then
     log "AWG installer already present"
@@ -579,9 +629,27 @@ install_awg_base() {
   curl -fsSL "$AWG_INSTALL_SCRIPT_URL" -o /root/install_amneziawg_en.sh
   chmod +x /root/install_amneziawg_en.sh
 
-  AMZ_AWG_VENDOR_BASE_URL="$AWG_VENDOR_BASE_URL" bash /root/install_amneziawg_en.sh --yes --route-all --port="${port}" || true
+  if AMZ_AWG_VENDOR_BASE_URL="$AWG_VENDOR_BASE_URL" bash /root/install_amneziawg_en.sh --yes --route-all --port="${port}"; then
+    installer_rc=0
+  else
+    installer_rc=$?
+  fi
 
-  [[ -x "${AWG_DIR}/manage_amneziawg.sh" ]] || err "AWG base install did not finish. If installer rebooted the server, run the same command again."
+  if [[ "$installer_rc" -ne 0 ]]; then
+    if resume_step="$(get_awg_resume_step)"; then
+      exit_awg_reboot_required "$resume_step"
+    fi
+
+    err "AWG base install failed with exit code ${installer_rc}"
+  fi
+
+  if [[ ! -x "${AWG_DIR}/manage_amneziawg.sh" ]]; then
+    if resume_step="$(get_awg_resume_step)"; then
+      exit_awg_reboot_required "$resume_step"
+    fi
+
+    err "AWG base install did not finish. If installer rebooted the server, run the same command again."
+  fi
 
   actual_port="$(get_awg_port)"
   [[ -n "$actual_port" ]] || err "Could not detect AWG port after installation"
@@ -1104,6 +1172,8 @@ print_selected_console_configs() {
 ########################################
 
 main() {
+  SCRIPT_ARGS=("$@")
+
   require_root
   parse_args "$@"
   split_ips
