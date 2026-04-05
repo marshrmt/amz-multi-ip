@@ -149,6 +149,16 @@ save_iptables() {
   netfilter-persistent save >/dev/null 2>&1 || iptables-save >/etc/iptables/rules.v4
 }
 
+ensure_awg_forward_rules() {
+  local nic="$1"
+
+  iptables -C FORWARD -i awg0 -j ACCEPT 2>/dev/null \
+    || iptables -I FORWARD 1 -i awg0 -j ACCEPT
+
+  iptables -C FORWARD -i "$nic" -o awg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null \
+    || iptables -I FORWARD 1 -i "$nic" -o awg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+}
+
 save_awg_port_to_state() {
   local port="$1"
   local tmp
@@ -892,6 +902,8 @@ prune_unwanted_awg_server_clients() {
 
 sync_awg_snat() {
   local nic="$1"
+
+  ensure_awg_forward_rules "$nic"
 
   jq -r '.awg.clients | to_entries[]? | @base64' "$STATE_FILE" | while IFS= read -r row; do
     local entry public_ip vpn_ip
