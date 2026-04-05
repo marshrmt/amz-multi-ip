@@ -850,7 +850,31 @@ regenerate_client() {
         return 1
     }
 
+    # Preserve user settings from current .conf (modified via modify command)
+    local current_dns="1.1.1.1" current_keepalive="33" current_allowed_ips="${ALLOWED_IPS:-0.0.0.0/0}" current_endpoint=""
+    if [[ -f "$AWG_DIR/${name}.conf" ]]; then
+        local _v
+        _v=$(sed -n 's/^DNS[ \t]*=[ \t]*//p' "$AWG_DIR/${name}.conf" | tr -d '[:space:]')
+        [[ -n "$_v" ]] && current_dns="$_v"
+        _v=$(sed -n 's/^PersistentKeepalive[ \t]*=[ \t]*//p' "$AWG_DIR/${name}.conf" | tr -d '[:space:]')
+        [[ -n "$_v" ]] && current_keepalive="$_v"
+        _v=$(sed -n '/^\[Peer\]/,$ s/^AllowedIPs[ \t]*=[ \t]*//p' "$AWG_DIR/${name}.conf" | tr -d '[:space:]')
+        [[ -n "$_v" ]] && current_allowed_ips="$_v"
+        _v=$(sed -n '/^\[Peer\]/,$ s/^Endpoint[ \t]*=[ \t]*//p' "$AWG_DIR/${name}.conf" | tr -d '[:space:]' | head -n1)
+        if [[ -n "$_v" ]]; then
+            if [[ "$_v" == \[* ]]; then
+                current_endpoint="${_v%%]:*}"
+                current_endpoint="${current_endpoint#\[}"
+            else
+                current_endpoint="${_v%:*}"
+            fi
+        fi
+    fi
+
     # Endpoint
+    if [[ -z "$endpoint" && -n "$current_endpoint" ]]; then
+        endpoint="$current_endpoint"
+    fi
     if [[ -z "$endpoint" ]]; then
         endpoint="${AWG_ENDPOINT:-}"
     fi
@@ -860,18 +884,6 @@ regenerate_client() {
     if [[ -z "$endpoint" ]]; then
         log_error "Failed to determine server public IP."
         return 1
-    fi
-
-    # Preserve user settings from current .conf (modified via modify command)
-    local current_dns="1.1.1.1" current_keepalive="33" current_allowed_ips="${ALLOWED_IPS:-0.0.0.0/0}"
-    if [[ -f "$AWG_DIR/${name}.conf" ]]; then
-        local _v
-        _v=$(sed -n 's/^DNS[ \t]*=[ \t]*//p' "$AWG_DIR/${name}.conf" | tr -d '[:space:]')
-        [[ -n "$_v" ]] && current_dns="$_v"
-        _v=$(sed -n 's/^PersistentKeepalive[ \t]*=[ \t]*//p' "$AWG_DIR/${name}.conf" | tr -d '[:space:]')
-        [[ -n "$_v" ]] && current_keepalive="$_v"
-        _v=$(sed -n '/^\[Peer\]/,$ s/^AllowedIPs[ \t]*=[ \t]*//p' "$AWG_DIR/${name}.conf" | tr -d '[:space:]')
-        [[ -n "$_v" ]] && current_allowed_ips="$_v"
     fi
 
     # Config regeneration

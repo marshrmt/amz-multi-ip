@@ -773,6 +773,7 @@ cleanup_awg_ipv6_runtime_rules() {
 enforce_awg_client_ipv4_only() {
   local name="$1"
   local conf_path="${AWG_DIR}/${name}.conf"
+  local current_endpoint=""
   local allowed_ips="0.0.0.0/0"
 
   if [[ -x "${AWG_DIR}/manage_amneziawg.sh" ]]; then
@@ -781,10 +782,11 @@ enforce_awg_client_ipv4_only() {
 
   [[ -f "$conf_path" ]] || return 0
 
+  current_endpoint="$(sed -n '/^\[Peer\]/,$ s/^Endpoint[ \t]*=[ \t]*//p' "$conf_path" | tr -d '[:space:]' | head -n1)"
   sed -i "s|^AllowedIPs = .*|AllowedIPs = ${allowed_ips}|" "$conf_path"
 
-  if [[ -x "${AWG_DIR}/manage_amneziawg.sh" ]]; then
-    bash "${AWG_DIR}/manage_amneziawg.sh" regen "$name" >/dev/null 2>&1 || true
+  if [[ -x "${AWG_DIR}/manage_amneziawg.sh" && -n "$current_endpoint" ]]; then
+    bash "${AWG_DIR}/manage_amneziawg.sh" modify "$name" Endpoint "$current_endpoint" >/dev/null 2>&1 || true
   fi
 }
 
