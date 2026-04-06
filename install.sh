@@ -26,6 +26,8 @@ AWG_SETUP_STATE_FILE="${AWG_DIR}/setup_state"
 
 SCRIPT_ARGS=()
 PRIMARY_NIC=""
+AMZ_PUBLIC_ROUTE_SCRIPT="/usr/local/sbin/amz-multi-public-routes.sh"
+AMZ_PUBLIC_ROUTE_SERVICE="amz-multi-public-routes.service"
 AMZ_AWG_ROUTE_SCRIPT="/usr/local/sbin/amz-multi-awg-routes.sh"
 AMZ_AWG_ROUTE_SERVICE="amz-multi-awg-routes.service"
 
@@ -191,6 +193,22 @@ route_via_from_output() {
   awk '/ via / {for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}' <<<"$route_line"
 }
 
+ipv4_to_int() {
+  local ip="$1"
+  local a b c d
+  IFS=. read -r a b c d <<<"$ip"
+  printf '%s\n' "$(( (a << 24) | (b << 16) | (c << 8) | d ))"
+}
+
+int_to_ipv4() {
+  local value="$1"
+  printf '%d.%d.%d.%d\n' \
+    "$(( (value >> 24) & 255 ))" \
+    "$(( (value >> 16) & 255 ))" \
+    "$(( (value >> 8) & 255 ))" \
+    "$(( value & 255 ))"
+}
+
 list_ip_bindings() {
   local ip="$1"
   ip -o -4 addr show scope global 2>/dev/null | awk -v ip="$ip" '$4 ~ ("^" ip "/") {print $2 " " $4}'
@@ -302,20 +320,26 @@ resolve_nic_for_ip() {
   printf '%s\n' "$PRIMARY_NIC"
 }
 
-validate_source_routes_for_ips() {
-  local ip expected_nic route_line route_dev
+routing_table_id_for_public_ip() {
+  local public_ip="$1"
+  ipv4_to_int "$public_ip"
+}
 
-  for ip in "${IPS[@]}"; do
-    expected_nic="$(resolve_nic_for_ip "$ip")"
-    route_line="$(ip -4 route get 1.1.1.1 from "$ip" 2>/dev/null || true)"
-    route_dev="$(route_dev_from_output "$route_line")"
+routing_priority_for_public_ip() {
+  local public_ip="$1"
+  ipv4_to_int "$public_ip"
+}
 
-    [[ -n "$route_dev" ]] || err "Could not build source route for ${ip}. Server networking for this IP is not ready."
+clear_policy_route_for_public_ip() {
+  local public_ip="$1"
+  local table priority
 
-    if [[ "$route_dev" != "$expected_nic" ]]; then
-      err "Source route for ${ip} exits via ${route_dev}, but ${ip} is bound to ${expected_nic}. Fix netplan/policy routing for this IP first."
-    fi
-  done
+  table="$(routing_table_id_for_public_ip "$public_ip")"
+  priority="$(routing_priority_for_public_ip "$public_ip")"
+
+  while ip rule del from "${public_ip}/32" table "$table" priority "$priority" 2>/dev/null; do :; done
+  while ip rule del from "${public_ip}/32" table "$table" 2>/dev/null; do :; done
+  ip route flush table "$table" 2>/dev/null || true
 }
 
 routing_table_id_for_vpn_ip() {
@@ -352,6 +376,116 @@ connected_route_for_nic_ip() {
     | awk -v src="$public_ip" '$0 ~ (" src " src "($| )") {print $1; exit}'
 }
 
+guess_gateway_for_connected_route() {
+  local connected_route="$1"
+  local public_ip="$2"
+  local network prefix network_int public_int gateway_int
+
+  [[ -n "$connected_route" ]] || return 1
+
+  network="${connected_route%/*}"
+  prefix="${connected_route#*/}"
+
+  [[ "$prefix" =~ ^[0-9]+$ ]] || return 1
+  (( prefix <= 30 )) || return 1
+
+  network_int="$(ipv4_to_int "$network")"
+  public_int="$(ipv4_to_int "$public_ip")"
+  gateway_int=$((network_int + 1))
+
+  (( gateway_int != public_int )) || return 1
+  int_to_ipv4 "$gateway_int"
+}
+
+gateway_for_nic_ip() {
+  local nic="$1"
+  local public_ip="$2"
+  local gateway connected_route
+
+  gateway="$(ip -4 route show table main default dev "$nic" 2>/dev/null | awk '/^default via / {print $3; exit}')"
+  if [[ -n "$gateway" ]]; then
+    printf '%s\n' "$gateway"
+    return 0
+  fi
+
+  gateway="$(
+    networkctl status "$nic" --no-pager 2>/dev/null \
+      | sed -n 's/^[[:space:]]*Gateway:[[:space:]]*//p' \
+      | head -n1 \
+      | awk '{print $1}'
+  )"
+  if [[ -n "$gateway" ]]; then
+    printf '%s\n' "$gateway"
+    return 0
+  fi
+
+  connected_route="$(connected_route_for_nic_ip "$nic" "$public_ip")"
+  if gateway="$(guess_gateway_for_connected_route "$connected_route" "$public_ip" 2>/dev/null)"; then
+    warn "Guessing gateway ${gateway} for ${public_ip} on ${nic} from ${connected_route}"
+    printf '%s\n' "$gateway"
+    return 0
+  fi
+
+  return 1
+}
+
+apply_policy_route_for_public_ip() {
+  local public_ip="$1"
+  local nic="$2"
+  local gateway connected_route table priority
+
+  clear_policy_route_for_public_ip "$public_ip"
+
+  if [[ "$nic" == "$PRIMARY_NIC" ]]; then
+    return 0
+  fi
+
+  connected_route="$(connected_route_for_nic_ip "$nic" "$public_ip")"
+  [[ -n "$connected_route" ]] || err "Could not determine connected route for ${public_ip} on ${nic}"
+
+  gateway="$(gateway_for_nic_ip "$nic" "$public_ip")" \
+    || err "Could not determine gateway for ${public_ip} on ${nic}. Fix netplan for this NIC first."
+
+  table="$(routing_table_id_for_public_ip "$public_ip")"
+  priority="$(routing_priority_for_public_ip "$public_ip")"
+
+  ip route add "$connected_route" dev "$nic" src "$public_ip" table "$table" 2>/dev/null || true
+  ip route add default via "$gateway" dev "$nic" table "$table" 2>/dev/null || true
+  ip rule add from "${public_ip}/32" table "$table" priority "$priority" 2>/dev/null || true
+  ip route flush cache
+}
+
+ensure_source_route_for_ip() {
+  local public_ip="$1"
+  local expected_nic route_line route_dev
+
+  expected_nic="$(resolve_nic_for_ip "$public_ip")"
+  route_line="$(ip -4 route get 1.1.1.1 from "$public_ip" 2>/dev/null || true)"
+  route_dev="$(route_dev_from_output "$route_line")"
+
+  if [[ "$route_dev" == "$expected_nic" ]]; then
+    return 0
+  fi
+
+  if [[ "$expected_nic" != "$PRIMARY_NIC" ]]; then
+    warn "Source route for ${public_ip} exits via ${route_dev:-unknown}, attempting auto-fix on ${expected_nic}"
+    apply_policy_route_for_public_ip "$public_ip" "$expected_nic"
+    route_line="$(ip -4 route get 1.1.1.1 from "$public_ip" 2>/dev/null || true)"
+    route_dev="$(route_dev_from_output "$route_line")"
+  fi
+
+  [[ -n "$route_dev" ]] || err "Could not build source route for ${public_ip}. Server networking for this IP is not ready."
+  [[ "$route_dev" == "$expected_nic" ]] || err "Source route for ${public_ip} exits via ${route_dev}, but ${public_ip} is bound to ${expected_nic}. Fix netplan/policy routing for this IP first."
+}
+
+validate_source_routes_for_ips() {
+  local ip
+
+  for ip in "${IPS[@]}"; do
+    ensure_source_route_for_ip "$ip"
+  done
+}
+
 apply_policy_route_for_vpn_ip() {
   local vpn_ip="$1"
   local public_ip="$2"
@@ -382,6 +516,58 @@ apply_policy_route_for_vpn_ip() {
 
   ip route add default via "$route_via" dev "$nic" table "$table" 2>/dev/null || true
   ip rule add from "${vpn_ip}/32" table "$table" priority "$priority" 2>/dev/null || true
+}
+
+write_public_ip_policy_route_service() {
+  local script_path="$AMZ_PUBLIC_ROUTE_SCRIPT"
+  local unit_path="/etc/systemd/system/${AMZ_PUBLIC_ROUTE_SERVICE}"
+  local ip nic connected_route gateway table priority
+
+  cat >"$script_path" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+EOF
+
+  for ip in "${IPS[@]}"; do
+    nic="$(resolve_nic_for_ip "$ip")"
+    [[ "$nic" != "$PRIMARY_NIC" ]] || continue
+
+    connected_route="$(connected_route_for_nic_ip "$nic" "$ip")"
+    gateway="$(gateway_for_nic_ip "$nic" "$ip")"
+    table="$(routing_table_id_for_public_ip "$ip")"
+    priority="$(routing_priority_for_public_ip "$ip")"
+
+    [[ -n "$connected_route" && -n "$gateway" ]] || continue
+
+    {
+      printf 'while ip rule del from %q table %q priority %q 2>/dev/null; do :; done\n' "${ip}/32" "$table" "$priority"
+      printf 'while ip rule del from %q table %q 2>/dev/null; do :; done\n' "${ip}/32" "$table"
+      printf 'ip route flush table %q 2>/dev/null || true\n' "$table"
+      printf 'ip route add %q dev %q src %q table %q 2>/dev/null || true\n' "$connected_route" "$nic" "$ip" "$table"
+      printf 'ip route add default via %q dev %q table %q 2>/dev/null || true\n' "$gateway" "$nic" "$table"
+      printf 'ip rule add from %q table %q priority %q 2>/dev/null || true\n' "${ip}/32" "$table" "$priority"
+    } >>"$script_path"
+  done
+
+  chmod 700 "$script_path"
+
+  cat >"$unit_path" <<EOF
+[Unit]
+Description=amz-multi public IP policy routes
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${script_path}
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now "$AMZ_PUBLIC_ROUTE_SERVICE" >/dev/null 2>&1 || true
 }
 
 write_awg_policy_route_service() {
@@ -1632,6 +1818,7 @@ main() {
   persist_sysctl_basic
   ensure_ip_aliases "$nic" "${IPS[@]}"
   validate_source_routes_for_ips
+  write_public_ip_policy_route_service
 
   if [[ "$PROTO" == "both" ]]; then
     ensure_awg_port_saved
