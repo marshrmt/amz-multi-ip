@@ -49,7 +49,7 @@ EOF
 }
 
 log()  { echo -e "\033[1;32m[+]\033[0m $*"; }
-warn() { echo -e "\033[1;33m[!]\033[0m $*"; }
+warn() { echo -e "\033[1;33m[!]\033[0m $*" >&2; }
 err()  { echo -e "\033[1;31m[-]\033[0m $*" >&2; exit 1; }
 route_debug() { echo -e "\033[0;36m[route-debug]\033[0m $*" >&2; }
 
