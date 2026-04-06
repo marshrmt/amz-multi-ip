@@ -323,18 +323,21 @@ resolve_nic_for_ip() {
 routing_table_id_for_public_ip() {
   local public_ip="$1"
   local nic="${2:-$(resolve_nic_for_ip "$public_ip")}"
-  local ifindex=0 last_octet
-  IFS=. read -r _ _ _ last_octet <<<"$public_ip"
+  local ifindex=0
   if [[ -r "/sys/class/net/${nic}/ifindex" ]]; then
     ifindex="$(cat "/sys/class/net/${nic}/ifindex" 2>/dev/null || echo 0)"
   fi
-  printf '%s\n' "$((12000 + (ifindex * 256) + last_octet))"
+  printf '%s\n' "$((200 + ifindex))"
 }
 
 routing_priority_for_public_ip() {
   local public_ip="$1"
   local nic="${2:-$(resolve_nic_for_ip "$public_ip")}"
-  routing_table_id_for_public_ip "$public_ip" "$nic"
+  local ifindex=0
+  if [[ -r "/sys/class/net/${nic}/ifindex" ]]; then
+    ifindex="$(cat "/sys/class/net/${nic}/ifindex" 2>/dev/null || echo 0)"
+  fi
+  printf '%s\n' "$((1000 + ifindex))"
 }
 
 clear_policy_route_for_public_ip() {
