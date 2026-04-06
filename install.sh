@@ -51,7 +51,7 @@ EOF
 log()  { echo -e "\033[1;32m[+]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[!]\033[0m $*"; }
 err()  { echo -e "\033[1;31m[-]\033[0m $*" >&2; exit 1; }
-route_debug() { echo -e "\033[0;36m[route-debug]\033[0m $*"; }
+route_debug() { echo -e "\033[0;36m[route-debug]\033[0m $*" >&2; }
 
 format_rerun_command() {
   local args=""
@@ -460,7 +460,7 @@ gateway_for_nic_ip() {
 
   connected_route="$(connected_route_for_nic_ip "$nic" "$public_ip")"
   if gateway="$(guess_gateway_for_connected_route "$connected_route" "$public_ip" 2>/dev/null)"; then
-    warn "Guessing gateway ${gateway} for ${public_ip} on ${nic} from ${connected_route}"
+    warn "Guessing gateway ${gateway} for ${public_ip} on ${nic} from ${connected_route}" >&2
     printf '%s\n' "$gateway"
     return 0
   fi
