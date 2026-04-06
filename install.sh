@@ -350,6 +350,7 @@ clear_policy_route_for_public_ip() {
 
   while ip rule del from "${public_ip}/32" table "$table" priority "$priority" 2>/dev/null; do :; done
   while ip rule del from "${public_ip}/32" table "$table" 2>/dev/null; do :; done
+  while ip rule del from "${public_ip}/32" 2>/dev/null; do :; done
   ip route flush table "$table" 2>/dev/null || true
 }
 
@@ -451,6 +452,8 @@ apply_policy_route_for_public_ip() {
     return 0
   fi
 
+  remove_ip_alias "$PRIMARY_NIC" "$public_ip"
+
   connected_route="$(connected_route_for_nic_ip "$nic" "$public_ip")"
   [[ -n "$connected_route" ]] || err "Could not determine connected route for ${public_ip} on ${nic}"
 
@@ -460,8 +463,8 @@ apply_policy_route_for_public_ip() {
   table="$(routing_table_id_for_public_ip "$public_ip" "$nic")"
   priority="$(routing_priority_for_public_ip "$public_ip" "$nic")"
 
-  ip route add "$connected_route" dev "$nic" src "$public_ip" table "$table" 2>/dev/null || true
-  ip route add default via "$gateway" dev "$nic" table "$table" 2>/dev/null || true
+  ip route replace "$connected_route" dev "$nic" src "$public_ip" table "$table" 2>/dev/null || true
+  ip route replace default via "$gateway" dev "$nic" table "$table" 2>/dev/null || true
   ip rule add from "${public_ip}/32" table "$table" priority "$priority" 2>/dev/null || true
   ip route flush cache
 }
@@ -553,9 +556,11 @@ EOF
     {
       printf 'while ip rule del from %q table %q priority %q 2>/dev/null; do :; done\n' "${ip}/32" "$table" "$priority"
       printf 'while ip rule del from %q table %q 2>/dev/null; do :; done\n' "${ip}/32" "$table"
+      printf 'while ip rule del from %q 2>/dev/null; do :; done\n' "${ip}/32"
       printf 'ip route flush table %q 2>/dev/null || true\n' "$table"
-      printf 'ip route add %q dev %q src %q table %q 2>/dev/null || true\n' "$connected_route" "$nic" "$ip" "$table"
-      printf 'ip route add default via %q dev %q table %q 2>/dev/null || true\n' "$gateway" "$nic" "$table"
+      printf 'ip addr del %q dev %q 2>/dev/null || true\n' "${ip}/32" "$PRIMARY_NIC"
+      printf 'ip route replace %q dev %q src %q table %q 2>/dev/null || true\n' "$connected_route" "$nic" "$ip" "$table"
+      printf 'ip route replace default via %q dev %q table %q 2>/dev/null || true\n' "$gateway" "$nic" "$table"
       printf 'ip rule add from %q table %q priority %q 2>/dev/null || true\n' "${ip}/32" "$table" "$priority"
     } >>"$script_path"
   done
