@@ -51,6 +51,7 @@ EOF
 log()  { echo -e "\033[1;32m[+]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[!]\033[0m $*"; }
 err()  { echo -e "\033[1;31m[-]\033[0m $*" >&2; exit 1; }
+route_debug() { echo -e "\033[0;36m[route-debug]\033[0m $*"; }
 
 format_rerun_command() {
   local args=""
@@ -376,6 +377,7 @@ clear_policy_route_for_public_ip() {
   table="$(routing_table_id_for_public_ip "$public_ip" "$nic")"
   priority="$(routing_priority_for_public_ip "$public_ip" "$nic")"
 
+  route_debug "Clearing public-IP rules for ${public_ip}: nic=${nic} table=${table} priority=${priority}"
   while ip rule del from "${public_ip}/32" table "$table" priority "$priority" 2>/dev/null; do :; done
   while ip rule del from "${public_ip}/32" table "$table" 2>/dev/null; do :; done
   while ip rule del from "${public_ip}/32" 2>/dev/null; do :; done
@@ -451,6 +453,7 @@ gateway_for_nic_ip() {
 
   gateway="$(ip -4 route show table main default dev "$nic" 2>/dev/null | awk '/^default via / {print $3; exit}')"
   if [[ -n "$gateway" ]]; then
+    route_debug "Gateway for ${public_ip} on ${nic} found in main table default: ${gateway}"
     printf '%s\n' "$gateway"
     return 0
   fi
@@ -469,11 +472,37 @@ gateway_for_nic_ip() {
       | awk '{print $1}'
   )"
   if [[ -n "$gateway" ]]; then
+    route_debug "Gateway for ${public_ip} on ${nic} found via networkctl: ${gateway}"
     printf '%s\n' "$gateway"
     return 0
   fi
 
   return 1
+}
+
+dump_public_route_debug() {
+  local public_ip="$1"
+  local nic="$2"
+  local table priority
+
+  table="$(routing_table_id_for_public_ip "$public_ip" "$nic")"
+  priority="$(routing_priority_for_public_ip "$public_ip" "$nic")"
+
+  route_debug "State for ${public_ip}: expected_nic=${nic} table=${table} priority=${priority}"
+  route_debug "Bindings for ${public_ip}:"
+  list_ip_bindings "$public_ip" 2>/dev/null | sed 's/^/[route-debug]   /' || true
+  route_debug "ip route get 1.1.1.1 from ${public_ip}:"
+  (ip -4 route get 1.1.1.1 from "$public_ip" 2>/dev/null || true) | sed 's/^/[route-debug]   /'
+  route_debug "ip rule:"
+  (ip rule 2>/dev/null || true) | sed 's/^/[route-debug]   /'
+  route_debug "ip route show table ${table}:"
+  (ip route show table "$table" 2>/dev/null || true) | sed 's/^/[route-debug]   /'
+  route_debug "ip -4 addr show dev ${nic}:"
+  (ip -4 addr show dev "$nic" 2>/dev/null || true) | sed 's/^/[route-debug]   /'
+  if [[ -n "$PRIMARY_NIC" && "$PRIMARY_NIC" != "$nic" ]]; then
+    route_debug "ip -4 addr show dev ${PRIMARY_NIC}:"
+    (ip -4 addr show dev "$PRIMARY_NIC" 2>/dev/null || true) | sed 's/^/[route-debug]   /'
+  fi
 }
 
 apply_policy_route_for_public_ip() {
@@ -498,10 +527,16 @@ apply_policy_route_for_public_ip() {
   table="$(routing_table_id_for_public_ip "$public_ip" "$nic")"
   priority="$(routing_priority_for_public_ip "$public_ip" "$nic")"
 
+  route_debug "Applying public-IP fix for ${public_ip}: nic=${nic} connected_route=${connected_route} gateway=${gateway} table=${table} priority=${priority}"
+  route_debug "Removing stale /32 alias from ${PRIMARY_NIC} for ${public_ip} if present"
+  route_debug "Running: ip route replace ${connected_route} dev ${nic} src ${public_ip} table ${table}"
   ip route replace "$connected_route" dev "$nic" src "$public_ip" table "$table" 2>/dev/null || true
+  route_debug "Running: ip route replace default via ${gateway} dev ${nic} table ${table}"
   ip route replace default via "$gateway" dev "$nic" table "$table" 2>/dev/null || true
+  route_debug "Running: ip rule add from ${public_ip}/32 table ${table} priority ${priority}"
   ip rule add from "${public_ip}/32" table "$table" priority "$priority" 2>/dev/null || true
   ip route flush cache
+  dump_public_route_debug "$public_ip" "$nic"
 }
 
 ensure_source_route_for_ip() {
@@ -518,13 +553,18 @@ ensure_source_route_for_ip() {
 
   if [[ "$expected_nic" != "$PRIMARY_NIC" ]]; then
     warn "Source route for ${public_ip} exits via ${route_dev:-unknown}, attempting auto-fix on ${expected_nic}"
+    dump_public_route_debug "$public_ip" "$expected_nic"
     apply_policy_route_for_public_ip "$public_ip" "$expected_nic"
     route_line="$(ip -4 route get 1.1.1.1 from "$public_ip" 2>/dev/null || true)"
     route_dev="$(route_dev_from_output "$route_line")"
+    route_debug "After auto-fix, route for ${public_ip}: ${route_line:-<empty>}"
   fi
 
   [[ -n "$route_dev" ]] || err "Could not build source route for ${public_ip}. Server networking for this IP is not ready."
-  [[ "$route_dev" == "$expected_nic" ]] || err "Source route for ${public_ip} exits via ${route_dev}, but ${public_ip} is bound to ${expected_nic}. Fix netplan/policy routing for this IP first."
+  if [[ "$route_dev" != "$expected_nic" ]]; then
+    dump_public_route_debug "$public_ip" "$expected_nic"
+    err "Source route for ${public_ip} exits via ${route_dev}, but ${public_ip} is bound to ${expected_nic}. Fix netplan/policy routing for this IP first."
+  fi
 }
 
 validate_source_routes_for_ips() {
