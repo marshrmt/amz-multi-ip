@@ -209,6 +209,34 @@ int_to_ipv4() {
     "$(( value & 255 ))"
 }
 
+cidr_for_nic_ip() {
+  local nic="$1"
+  local public_ip="$2"
+  ip -o -4 addr show dev "$nic" scope global 2>/dev/null \
+    | awk -v ip="$public_ip" '$4 ~ ("^" ip "/") {print $4; exit}'
+}
+
+network_from_cidr() {
+  local cidr="$1"
+  local ip prefix ip_int mask_int network_int
+
+  ip="${cidr%/*}"
+  prefix="${cidr#*/}"
+  [[ "$prefix" =~ ^[0-9]+$ ]] || return 1
+  (( prefix >= 0 && prefix <= 32 )) || return 1
+
+  ip_int="$(ipv4_to_int "$ip")"
+
+  if (( prefix == 0 )); then
+    mask_int=0
+  else
+    mask_int=$(( (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF ))
+  fi
+
+  network_int=$(( ip_int & mask_int ))
+  printf '%s/%s\n' "$(int_to_ipv4 "$network_int")" "$prefix"
+}
+
 list_ip_bindings() {
   local ip="$1"
   ip -o -4 addr show scope global 2>/dev/null | awk -v ip="$ip" '$4 ~ ("^" ip "/") {print $2 " " $4}'
@@ -383,6 +411,13 @@ clear_policy_route_for_vpn_ip() {
 connected_route_for_nic_ip() {
   local nic="$1"
   local public_ip="$2"
+  local cidr
+
+  cidr="$(cidr_for_nic_ip "$nic" "$public_ip")"
+  if [[ -n "$cidr" ]]; then
+    network_from_cidr "$cidr"
+    return 0
+  fi
 
   ip -4 route show table main dev "$nic" proto kernel scope link 2>/dev/null \
     | awk -v src="$public_ip" '$0 ~ (" src " src "($| )") {print $1; exit}'
@@ -420,6 +455,13 @@ gateway_for_nic_ip() {
     return 0
   fi
 
+  connected_route="$(connected_route_for_nic_ip "$nic" "$public_ip")"
+  if gateway="$(guess_gateway_for_connected_route "$connected_route" "$public_ip" 2>/dev/null)"; then
+    warn "Guessing gateway ${gateway} for ${public_ip} on ${nic} from ${connected_route}"
+    printf '%s\n' "$gateway"
+    return 0
+  fi
+
   gateway="$(
     networkctl status "$nic" --no-pager 2>/dev/null \
       | sed -n 's/^[[:space:]]*Gateway:[[:space:]]*//p' \
@@ -427,13 +469,6 @@ gateway_for_nic_ip() {
       | awk '{print $1}'
   )"
   if [[ -n "$gateway" ]]; then
-    printf '%s\n' "$gateway"
-    return 0
-  fi
-
-  connected_route="$(connected_route_for_nic_ip "$nic" "$public_ip")"
-  if gateway="$(guess_gateway_for_connected_route "$connected_route" "$public_ip" 2>/dev/null)"; then
-    warn "Guessing gateway ${gateway} for ${public_ip} on ${nic} from ${connected_route}"
     printf '%s\n' "$gateway"
     return 0
   fi
