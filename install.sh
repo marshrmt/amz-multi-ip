@@ -25,6 +25,11 @@ AWG_INSTALL_SCRIPT_URL="${AWG_VENDOR_BASE_URL}/install_amneziawg_en.sh"
 AWG_SETUP_STATE_FILE="${AWG_DIR}/setup_state"
 
 SCRIPT_ARGS=()
+PRIMARY_NIC=""
+AMZ_AWG_ROUTE_SCRIPT="/usr/local/sbin/amz-multi-awg-routes.sh"
+AMZ_AWG_ROUTE_SERVICE="amz-multi-awg-routes.service"
+
+declare -Ag RESOLVED_IP_NICS=()
 
 usage() {
   cat <<'EOF'
@@ -176,30 +181,321 @@ EOF
   sysctl --system >/dev/null
 }
 
+route_dev_from_output() {
+  local route_line="$1"
+  awk '/ dev / {for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' <<<"$route_line"
+}
+
+route_via_from_output() {
+  local route_line="$1"
+  awk '/ via / {for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}' <<<"$route_line"
+}
+
+list_ip_bindings() {
+  local ip="$1"
+  ip -o -4 addr show scope global 2>/dev/null | awk -v ip="$ip" '$4 ~ ("^" ip "/") {print $2 " " $4}'
+}
+
+ip_exists_anywhere() {
+  local ip="$1"
+  list_ip_bindings "$ip" | grep -q .
+}
+
+find_existing_nic_for_ip() {
+  local ip="$1"
+  local primary_nic="$2"
+  local line nic cidr prefix first_nic="" chosen_nic="" primary_has_32=0
+  local -a bindings=()
+
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    bindings+=("$line")
+  done < <(list_ip_bindings "$ip")
+
+  if [[ "${#bindings[@]}" -eq 0 ]]; then
+    return 1
+  fi
+
+  if [[ "${#bindings[@]}" -eq 1 ]]; then
+    printf '%s\n' "${bindings[0]%% *}"
+    return 0
+  fi
+
+  for line in "${bindings[@]}"; do
+    nic="${line%% *}"
+    cidr="${line#* }"
+    prefix="${cidr#*/}"
+    [[ -z "$first_nic" ]] && first_nic="$nic"
+
+    if [[ "$nic" == "$primary_nic" && "$prefix" == "32" ]]; then
+      primary_has_32=1
+      continue
+    fi
+
+    if [[ "$prefix" != "32" ]]; then
+      chosen_nic="$nic"
+      break
+    fi
+
+    if [[ -z "$chosen_nic" && "$nic" != "$primary_nic" ]]; then
+      chosen_nic="$nic"
+    fi
+  done
+
+  if [[ "$primary_has_32" -eq 1 && -n "$chosen_nic" && "$chosen_nic" != "$primary_nic" ]]; then
+    warn "Detected conflicting alias for ${ip} on ${primary_nic}; keeping ${chosen_nic} and removing ${ip}/32 from ${primary_nic}"
+    ip addr del "${ip}/32" dev "$primary_nic" 2>/dev/null || true
+    printf '%s\n' "$chosen_nic"
+    return 0
+  fi
+
+  if [[ -n "$chosen_nic" ]]; then
+    printf '%s\n' "$chosen_nic"
+    return 0
+  fi
+
+  printf '%s\n' "$first_nic"
+}
+
 ensure_ip_aliases() {
   local nic="$1"; shift
-  local ip
+  local ip existing_nic
   for ip in "$@"; do
+    if existing_nic="$(find_existing_nic_for_ip "$ip" "$nic" 2>/dev/null)"; then
+      RESOLVED_IP_NICS["$ip"]="$existing_nic"
+      continue
+    fi
+
     if ! ip -4 addr show dev "$nic" | grep -qw "$ip"; then
       log "Adding $ip to $nic"
       ip addr add "${ip}/32" dev "$nic" || true
     fi
+
+    RESOLVED_IP_NICS["$ip"]="$nic"
   done
 }
 
 remove_ip_alias() {
   local nic="$1"
   local ip="$2"
-  if ip -4 addr show dev "$nic" | grep -qw "$ip"; then
+
+  if ip -o -4 addr show dev "$nic" 2>/dev/null | awk -v ip="$ip" '$4 == ip"/32" {found=1} END{exit found?0:1}'; then
     ip addr del "${ip}/32" dev "$nic" || true
   fi
+}
+
+resolve_nic_for_ip() {
+  local ip="$1"
+  local nic
+
+  if [[ -n "${RESOLVED_IP_NICS[$ip]+x}" ]]; then
+    printf '%s\n' "${RESOLVED_IP_NICS[$ip]}"
+    return 0
+  fi
+
+  if nic="$(find_existing_nic_for_ip "$ip" "$PRIMARY_NIC" 2>/dev/null)"; then
+    RESOLVED_IP_NICS["$ip"]="$nic"
+    printf '%s\n' "$nic"
+    return 0
+  fi
+
+  printf '%s\n' "$PRIMARY_NIC"
+}
+
+validate_source_routes_for_ips() {
+  local ip expected_nic route_line route_dev
+
+  for ip in "${IPS[@]}"; do
+    expected_nic="$(resolve_nic_for_ip "$ip")"
+    route_line="$(ip -4 route get 1.1.1.1 from "$ip" 2>/dev/null || true)"
+    route_dev="$(route_dev_from_output "$route_line")"
+
+    [[ -n "$route_dev" ]] || err "Could not build source route for ${ip}. Server networking for this IP is not ready."
+
+    if [[ "$route_dev" != "$expected_nic" ]]; then
+      err "Source route for ${ip} exits via ${route_dev}, but ${ip} is bound to ${expected_nic}. Fix netplan/policy routing for this IP first."
+    fi
+  done
+}
+
+routing_table_id_for_vpn_ip() {
+  local vpn_ip="$1"
+  local last_octet
+  IFS=. read -r _ _ _ last_octet <<<"$vpn_ip"
+  printf '%s\n' "$((11000 + last_octet))"
+}
+
+routing_priority_for_vpn_ip() {
+  local vpn_ip="$1"
+  local last_octet
+  IFS=. read -r _ _ _ last_octet <<<"$vpn_ip"
+  printf '%s\n' "$((11000 + last_octet))"
+}
+
+clear_policy_route_for_vpn_ip() {
+  local vpn_ip="$1"
+  local table priority
+
+  table="$(routing_table_id_for_vpn_ip "$vpn_ip")"
+  priority="$(routing_priority_for_vpn_ip "$vpn_ip")"
+
+  while ip rule del from "${vpn_ip}/32" table "$table" priority "$priority" 2>/dev/null; do :; done
+  while ip rule del from "${vpn_ip}/32" table "$table" 2>/dev/null; do :; done
+  ip route flush table "$table" 2>/dev/null || true
+}
+
+connected_route_for_nic_ip() {
+  local nic="$1"
+  local public_ip="$2"
+
+  ip -4 route show table main dev "$nic" proto kernel scope link 2>/dev/null \
+    | awk -v src="$public_ip" '$0 ~ (" src " src "($| )") {print $1; exit}'
+}
+
+apply_policy_route_for_vpn_ip() {
+  local vpn_ip="$1"
+  local public_ip="$2"
+  local nic="$3"
+  local route_line route_dev route_via table priority connected_route
+
+  clear_policy_route_for_vpn_ip "$vpn_ip"
+
+  if [[ "$nic" == "$PRIMARY_NIC" ]]; then
+    return 0
+  fi
+
+  route_line="$(ip -4 route get 1.1.1.1 from "$public_ip" 2>/dev/null || true)"
+  route_dev="$(route_dev_from_output "$route_line")"
+  route_via="$(route_via_from_output "$route_line")"
+
+  [[ -n "$route_dev" ]] || err "Could not determine route device for ${public_ip}"
+  [[ "$route_dev" == "$nic" ]] || err "Route for ${public_ip} exits via ${route_dev}, but AWG needs ${nic}. Fix server networking for ${public_ip} first."
+  [[ -n "$route_via" ]] || err "Could not determine gateway for ${public_ip} on ${nic}"
+
+  table="$(routing_table_id_for_vpn_ip "$vpn_ip")"
+  priority="$(routing_priority_for_vpn_ip "$vpn_ip")"
+  connected_route="$(connected_route_for_nic_ip "$nic" "$public_ip")"
+
+  if [[ -n "$connected_route" ]]; then
+    ip route add "$connected_route" dev "$nic" src "$public_ip" table "$table" 2>/dev/null || true
+  fi
+
+  ip route add default via "$route_via" dev "$nic" table "$table" 2>/dev/null || true
+  ip rule add from "${vpn_ip}/32" table "$table" priority "$priority" 2>/dev/null || true
+}
+
+write_awg_policy_route_service() {
+  local script_path="$AMZ_AWG_ROUTE_SCRIPT"
+  local unit_path="/etc/systemd/system/${AMZ_AWG_ROUTE_SERVICE}"
+  local ip nic vpn_ip
+
+  cat >"$script_path" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+route_dev_from_output() {
+  local route_line="$1"
+  awk '/ dev / {for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' <<<"$route_line"
+}
+
+route_via_from_output() {
+  local route_line="$1"
+  awk '/ via / {for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}' <<<"$route_line"
+}
+
+routing_table_id_for_vpn_ip() {
+  local vpn_ip="$1"
+  local last_octet
+  IFS=. read -r _ _ _ last_octet <<<"$vpn_ip"
+  printf '%s\n' "$((11000 + last_octet))"
+}
+
+routing_priority_for_vpn_ip() {
+  local vpn_ip="$1"
+  local last_octet
+  IFS=. read -r _ _ _ last_octet <<<"$vpn_ip"
+  printf '%s\n' "$((11000 + last_octet))"
+}
+
+clear_all_amz_awg_policy_routes() {
+  local last_octet table
+  for last_octet in $(seq 1 254); do
+    table="$((11000 + last_octet))"
+    while ip rule del table "$table" 2>/dev/null; do :; done
+    ip route flush table "$table" 2>/dev/null || true
+  done
+}
+
+connected_route_for_nic_ip() {
+  local nic="$1"
+  local public_ip="$2"
+  ip -4 route show table main dev "$nic" proto kernel scope link 2>/dev/null \
+    | awk -v src="$public_ip" '$0 ~ (" src " src "($| )") {print $1; exit}'
+}
+
+apply_route() {
+  local vpn_ip="$1"
+  local public_ip="$2"
+  local nic="$3"
+  local route_line route_dev route_via connected_route table priority
+
+  route_line="$(ip -4 route get 1.1.1.1 from "$public_ip" 2>/dev/null || true)"
+  route_dev="$(route_dev_from_output "$route_line")"
+  route_via="$(route_via_from_output "$route_line")"
+  [[ -n "$route_dev" && "$route_dev" == "$nic" && -n "$route_via" ]] || return 0
+
+  connected_route="$(connected_route_for_nic_ip "$nic" "$public_ip")"
+  table="$(routing_table_id_for_vpn_ip "$vpn_ip")"
+  priority="$(routing_priority_for_vpn_ip "$vpn_ip")"
+
+  if [[ -n "$connected_route" ]]; then
+    ip route add "$connected_route" dev "$nic" src "$public_ip" table "$table" 2>/dev/null || true
+  fi
+
+  ip route add default via "$route_via" dev "$nic" table "$table" 2>/dev/null || true
+  ip rule add from "${vpn_ip}/32" table "$table" priority "$priority" 2>/dev/null || true
+}
+
+clear_all_amz_awg_policy_routes
+EOF
+
+  while IFS= read -r ip; do
+    [[ -z "$ip" ]] && continue
+    nic="$(resolve_nic_for_ip "$ip")"
+    vpn_ip="$(jq -r --arg ip "$ip" '.awg.clients[$ip].vpn_ip // ""' "$STATE_FILE")"
+    [[ -n "$vpn_ip" ]] || continue
+
+    if [[ "$nic" != "$PRIMARY_NIC" ]]; then
+      printf 'apply_route %q %q %q\n' "$vpn_ip" "$ip" "$nic" >>"$script_path"
+    fi
+  done < <(jq -r '.awg.clients | keys[]?' "$STATE_FILE")
+
+  chmod 700 "$script_path"
+
+  cat >"$unit_path" <<EOF
+[Unit]
+Description=amz-multi AWG policy routes
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${script_path}
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now "$AMZ_AWG_ROUTE_SERVICE" >/dev/null 2>&1 || true
 }
 
 save_iptables() {
   netfilter-persistent save >/dev/null 2>&1 || iptables-save >/etc/iptables/rules.v4
 }
 
-ensure_awg_forward_rules() {
+ensure_awg_forward_rule_for_nic() {
   local nic="$1"
 
   iptables -C FORWARD -i awg0 -j ACCEPT 2>/dev/null \
@@ -207,6 +503,26 @@ ensure_awg_forward_rules() {
 
   iptables -C FORWARD -i "$nic" -o awg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null \
     || iptables -I FORWARD 1 -i "$nic" -o awg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+}
+
+ensure_awg_forward_rules() {
+  local nic="$1"
+  ensure_awg_forward_rule_for_nic "$nic"
+}
+
+delete_awg_snat_rules_for_vpn_ip() {
+  local vpn_ip="$1"
+  local line cmd
+  local -a args
+
+  while IFS= read -r line; do
+    [[ "$line" == *"-s ${vpn_ip}/32 "* ]] || continue
+    [[ "$line" == *" -j SNAT "* ]] || continue
+
+    cmd="${line/-A /-D }"
+    read -r -a args <<<"$cmd"
+    iptables -t nat "${args[@]}" || true
+  done < <(iptables -t nat -S POSTROUTING 2>/dev/null || true)
 }
 
 save_awg_port_to_state() {
@@ -1016,18 +1332,24 @@ awg_drop_ip_from_state() {
 }
 
 awg_remove_name() {
-  local nic="$1"
-  local name="$2"
+  local name="$1"
   local public_ip vpn_ip conf_path
 
   public_ip="$(awg_ip_from_name "$name")"
   conf_path="$(find_awg_conf_for_name "$name")"
-  vpn_ip="$(extract_awg_vpn_ip_from_conf "$conf_path")"
+  vpn_ip=""
 
-  if [[ -n "$vpn_ip" && -n "$public_ip" ]]; then
-    while iptables -t nat -C POSTROUTING -s "${vpn_ip}/32" -o "$nic" -j SNAT --to-source "$public_ip" 2>/dev/null; do
-      iptables -t nat -D POSTROUTING -s "${vpn_ip}/32" -o "$nic" -j SNAT --to-source "$public_ip" || true
-    done
+  if [[ -n "$public_ip" ]]; then
+    vpn_ip="$(jq -r --arg ip "$public_ip" '.awg.clients[$ip].vpn_ip // ""' "$STATE_FILE" 2>/dev/null || true)"
+  fi
+
+  if [[ -z "$vpn_ip" ]]; then
+    vpn_ip="$(extract_awg_vpn_ip_from_conf "$conf_path")"
+  fi
+
+  if [[ -n "$vpn_ip" ]]; then
+    delete_awg_snat_rules_for_vpn_ip "$vpn_ip"
+    clear_policy_route_for_vpn_ip "$vpn_ip"
   fi
 
   awg_remove_peer_best_effort "$name"
@@ -1042,17 +1364,15 @@ awg_remove_name() {
 }
 
 awg_remove_ip() {
-  local nic="$1"
-  local ip="$2"
+  local ip="$1"
   local name vpn_ip tmp
 
   name="$(jq -r --arg ip "$ip" '.awg.clients[$ip].name // ""' "$STATE_FILE")"
   vpn_ip="$(jq -r --arg ip "$ip" '.awg.clients[$ip].vpn_ip // ""' "$STATE_FILE")"
 
   if [[ -n "$vpn_ip" ]]; then
-    while iptables -t nat -C POSTROUTING -s "${vpn_ip}/32" -o "$nic" -j SNAT --to-source "$ip" 2>/dev/null; do
-      iptables -t nat -D POSTROUTING -s "${vpn_ip}/32" -o "$nic" -j SNAT --to-source "$ip" || true
-    done
+    delete_awg_snat_rules_for_vpn_ip "$vpn_ip"
+    clear_policy_route_for_vpn_ip "$vpn_ip"
   fi
 
   [[ -n "$name" ]] && awg_remove_peer_best_effort "$name"
@@ -1066,8 +1386,7 @@ awg_remove_ip() {
 }
 
 prune_unwanted_awg_server_clients() {
-  local nic="$1"
-  local name public_ip
+  local name public_ip resolved_nic
 
   while IFS= read -r name; do
     [[ -z "$name" ]] && continue
@@ -1076,8 +1395,9 @@ prune_unwanted_awg_server_clients() {
     [[ -n "$public_ip" ]] || continue
 
     if ! ip_is_wanted "$public_ip"; then
-      awg_remove_name "$nic" "$name"
-      remove_ip_alias "$nic" "$public_ip"
+      resolved_nic="$(resolve_nic_for_ip "$public_ip")"
+      awg_remove_name "$name"
+      remove_ip_alias "$resolved_nic" "$public_ip"
     fi
   done < <(list_awg_server_client_names)
 }
@@ -1088,19 +1408,20 @@ sync_awg_snat() {
   ensure_awg_forward_rules "$nic"
 
   jq -r '.awg.clients | to_entries[]? | @base64' "$STATE_FILE" | while IFS= read -r row; do
-    local entry public_ip vpn_ip
+    local entry public_ip vpn_ip resolved_nic
     entry="$(echo "$row" | base64 -d)"
     public_ip="$(jq -r '.key' <<<"$entry")"
     vpn_ip="$(jq -r '.value.vpn_ip' <<<"$entry")"
 
     [[ -n "$vpn_ip" && "$vpn_ip" != "null" ]] || continue
 
-    while iptables -t nat -C POSTROUTING -s "${vpn_ip}/32" -o "$nic" -j SNAT --to-source "$public_ip" 2>/dev/null; do
-      iptables -t nat -D POSTROUTING -s "${vpn_ip}/32" -o "$nic" -j SNAT --to-source "$public_ip" || true
-    done
+    resolved_nic="$(resolve_nic_for_ip "$public_ip")"
+    ensure_awg_forward_rule_for_nic "$resolved_nic"
+    delete_awg_snat_rules_for_vpn_ip "$vpn_ip"
+    apply_policy_route_for_vpn_ip "$vpn_ip" "$public_ip" "$resolved_nic"
 
     # Specific per-client SNAT must stay above the generic MASQUERADE from awg-quick.
-    iptables -t nat -I POSTROUTING 1 -s "${vpn_ip}/32" -o "$nic" -j SNAT --to-source "$public_ip"
+    iptables -t nat -I POSTROUTING 1 -s "${vpn_ip}/32" -o "$resolved_nic" -j SNAT --to-source "$public_ip"
   done
 }
 
@@ -1201,9 +1522,10 @@ sync_awg() {
   done
 
   if [[ "$PRUNE" == "1" ]]; then
-    prune_unwanted_awg_server_clients "$nic"
+    prune_unwanted_awg_server_clients
 
     while IFS= read -r ip; do
+      local resolved_nic
       [[ -z "$ip" ]] && continue
       keep=0
       for wanted in "${IPS[@]}"; do
@@ -1214,14 +1536,16 @@ sync_awg() {
       done
 
       if [[ "$keep" -eq 0 ]]; then
-        awg_remove_ip "$nic" "$ip"
-        remove_ip_alias "$nic" "$ip"
+        resolved_nic="$(resolve_nic_for_ip "$ip")"
+        awg_remove_ip "$ip"
+        remove_ip_alias "$resolved_nic" "$ip"
       fi
     done < <(jq -r '.awg.clients | keys[]?' "$STATE_FILE")
   fi
 
   sync_awg_snat "$nic"
   refresh_awg_artifacts_into_state
+  write_awg_policy_route_service
   ensure_awg_healthy
   cleanup_awg_ipv6_runtime_rules "$nic"
   cleanup_legacy_awg_masquerade_rules "$nic"
@@ -1303,9 +1627,11 @@ main() {
   local nic
   nic="$(detect_nic)"
   [[ -n "$nic" ]] || err "Could not detect WAN interface"
+  PRIMARY_NIC="$nic"
 
   persist_sysctl_basic
   ensure_ip_aliases "$nic" "${IPS[@]}"
+  validate_source_routes_for_ips
 
   if [[ "$PROTO" == "both" ]]; then
     ensure_awg_port_saved
