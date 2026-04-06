@@ -322,20 +322,28 @@ resolve_nic_for_ip() {
 
 routing_table_id_for_public_ip() {
   local public_ip="$1"
-  ipv4_to_int "$public_ip"
+  local nic="${2:-$(resolve_nic_for_ip "$public_ip")}"
+  local ifindex=0 last_octet
+  IFS=. read -r _ _ _ last_octet <<<"$public_ip"
+  if [[ -r "/sys/class/net/${nic}/ifindex" ]]; then
+    ifindex="$(cat "/sys/class/net/${nic}/ifindex" 2>/dev/null || echo 0)"
+  fi
+  printf '%s\n' "$((12000 + (ifindex * 256) + last_octet))"
 }
 
 routing_priority_for_public_ip() {
   local public_ip="$1"
-  ipv4_to_int "$public_ip"
+  local nic="${2:-$(resolve_nic_for_ip "$public_ip")}"
+  routing_table_id_for_public_ip "$public_ip" "$nic"
 }
 
 clear_policy_route_for_public_ip() {
   local public_ip="$1"
+  local nic="${2:-$(resolve_nic_for_ip "$public_ip")}"
   local table priority
 
-  table="$(routing_table_id_for_public_ip "$public_ip")"
-  priority="$(routing_priority_for_public_ip "$public_ip")"
+  table="$(routing_table_id_for_public_ip "$public_ip" "$nic")"
+  priority="$(routing_priority_for_public_ip "$public_ip" "$nic")"
 
   while ip rule del from "${public_ip}/32" table "$table" priority "$priority" 2>/dev/null; do :; done
   while ip rule del from "${public_ip}/32" table "$table" 2>/dev/null; do :; done
@@ -434,7 +442,7 @@ apply_policy_route_for_public_ip() {
   local nic="$2"
   local gateway connected_route table priority
 
-  clear_policy_route_for_public_ip "$public_ip"
+  clear_policy_route_for_public_ip "$public_ip" "$nic"
 
   if [[ "$nic" == "$PRIMARY_NIC" ]]; then
     return 0
@@ -446,8 +454,8 @@ apply_policy_route_for_public_ip() {
   gateway="$(gateway_for_nic_ip "$nic" "$public_ip")" \
     || err "Could not determine gateway for ${public_ip} on ${nic}. Fix netplan for this NIC first."
 
-  table="$(routing_table_id_for_public_ip "$public_ip")"
-  priority="$(routing_priority_for_public_ip "$public_ip")"
+  table="$(routing_table_id_for_public_ip "$public_ip" "$nic")"
+  priority="$(routing_priority_for_public_ip "$public_ip" "$nic")"
 
   ip route add "$connected_route" dev "$nic" src "$public_ip" table "$table" 2>/dev/null || true
   ip route add default via "$gateway" dev "$nic" table "$table" 2>/dev/null || true
@@ -534,8 +542,8 @@ EOF
 
     connected_route="$(connected_route_for_nic_ip "$nic" "$ip")"
     gateway="$(gateway_for_nic_ip "$nic" "$ip")"
-    table="$(routing_table_id_for_public_ip "$ip")"
-    priority="$(routing_priority_for_public_ip "$ip")"
+    table="$(routing_table_id_for_public_ip "$ip" "$nic")"
+    priority="$(routing_priority_for_public_ip "$ip" "$nic")"
 
     [[ -n "$connected_route" && -n "$gateway" ]] || continue
 
