@@ -53,6 +53,14 @@ warn() { echo -e "\033[1;33m[!]\033[0m $*" >&2; }
 err()  { echo -e "\033[1;31m[-]\033[0m $*" >&2; exit 1; }
 route_debug() { echo -e "\033[0;36m[route-debug]\033[0m $*" >&2; }
 
+on_err() {
+  local rc="$?"
+  echo -e "\033[1;31m[-]\033[0m install.sh failed at line ${1}: ${2} (exit ${rc})" >&2
+  exit "$rc"
+}
+
+trap 'on_err "${LINENO}" "${BASH_COMMAND}"' ERR
+
 format_rerun_command() {
   local args=""
 
@@ -601,6 +609,8 @@ ensure_source_route_for_ip() {
     dump_public_route_debug "$public_ip" "$expected_nic"
     err "Source route for ${public_ip} looks correct, but egress probe still does not return ${public_ip}. Fix provider routing for this IP first."
   fi
+
+  return 0
 }
 
 validate_source_routes_for_ips() {
@@ -609,6 +619,8 @@ validate_source_routes_for_ips() {
   for ip in "${IPS[@]}"; do
     ensure_source_route_for_ip "$ip"
   done
+
+  return 0
 }
 
 apply_policy_route_for_vpn_ip() {
@@ -700,6 +712,8 @@ EOF
 
   systemctl daemon-reload
   systemctl enable --now "$AMZ_PUBLIC_ROUTE_SERVICE" >/dev/null 2>&1 || true
+
+  return 0
 }
 
 write_awg_policy_route_service() {
@@ -1951,7 +1965,9 @@ main() {
   ensure_ip_aliases "$nic" "${IPS[@]}"
   log "Checking source routing for requested IPs"
   validate_source_routes_for_ips
+  log "Source routing checks completed"
   write_public_ip_policy_route_service
+  log "Source routing persistence prepared"
 
   if [[ "$PROTO" == "both" ]]; then
     ensure_awg_port_saved
