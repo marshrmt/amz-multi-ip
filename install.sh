@@ -109,7 +109,7 @@ rand_hex()  { local n="${1:-8}"; openssl rand -hex "$n"; }
 rand_uuid() { cat /proc/sys/kernel/random/uuid; }
 
 detect_nic() {
-  ip route get 1.1.1.1 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
+  ip route get 1.1.1.1 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' || true
 }
 
 ensure_pkgs() {
@@ -181,7 +181,7 @@ net.ipv4.ip_forward=1
 net.ipv4.conf.all.rp_filter=2
 net.ipv4.conf.default.rp_filter=2
 EOF
-  sysctl --system >/dev/null
+  sysctl --system >/dev/null || warn "sysctl --system returned a non-zero status; continuing"
 }
 
 route_dev_from_output() {
@@ -663,8 +663,8 @@ EOF
 
     if [[ -z "$connected_route" || -z "$gateway" ]]; then
       [[ "$nic" != "$PRIMARY_NIC" ]] || continue
-      connected_route="$(connected_route_for_nic_ip "$nic" "$ip")"
-      gateway="$(gateway_for_nic_ip "$nic" "$ip")"
+      connected_route="$(connected_route_for_nic_ip "$nic" "$ip" || true)"
+      gateway="$(gateway_for_nic_ip "$nic" "$ip" || true)"
     fi
 
     [[ -n "$connected_route" && -n "$gateway" ]] || continue
@@ -1943,12 +1943,13 @@ main() {
   ensure_pkgs
 
   local nic
-  nic="$(detect_nic)"
+  nic="$(detect_nic || true)"
   [[ -n "$nic" ]] || err "Could not detect WAN interface"
   PRIMARY_NIC="$nic"
 
   persist_sysctl_basic
   ensure_ip_aliases "$nic" "${IPS[@]}"
+  log "Checking source routing for requested IPs"
   validate_source_routes_for_ips
   write_public_ip_policy_route_service
 
