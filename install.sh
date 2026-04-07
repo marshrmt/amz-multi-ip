@@ -670,8 +670,8 @@ EOF
 
     table="$(routing_table_id_for_public_ip "$ip" "$nic")"
     priority="$(routing_priority_for_public_ip "$ip" "$nic")"
-    connected_route="$(ip route show table "$table" 2>/dev/null | awk '!/^default/ {print $1; exit}')"
-    gateway="$(ip route show table "$table" 2>/dev/null | awk '/^default via / {print $3; exit}')"
+    connected_route="$( (ip route show table "$table" 2>/dev/null || true) | awk '!/^default/ {print $1; exit}' )"
+    gateway="$( (ip route show table "$table" 2>/dev/null || true) | awk '/^default via / {print $3; exit}' )"
 
     if [[ -z "$connected_route" || -z "$gateway" ]]; then
       [[ "$nic" != "$PRIMARY_NIC" ]] || continue
