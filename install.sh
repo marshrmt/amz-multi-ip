@@ -210,6 +210,11 @@ int_to_ipv4() {
     "$(( value & 255 ))"
 }
 
+cidr_prefix() {
+  local cidr="$1"
+  printf '%s\n' "${cidr#*/}"
+}
+
 cidr_for_nic_ip() {
   local nic="$1"
   local public_ip="$2"
@@ -413,10 +418,15 @@ clear_policy_route_for_vpn_ip() {
 connected_route_for_nic_ip() {
   local nic="$1"
   local public_ip="$2"
-  local cidr
+  local cidr prefix
 
   cidr="$(cidr_for_nic_ip "$nic" "$public_ip")"
   if [[ -n "$cidr" ]]; then
+    prefix="$(cidr_prefix "$cidr")"
+    if [[ "$prefix" == "32" ]]; then
+      network_from_cidr "${public_ip%.*}.0/24"
+      return 0
+    fi
     network_from_cidr "$cidr"
     return 0
   fi
@@ -449,7 +459,20 @@ guess_gateway_for_connected_route() {
 gateway_for_nic_ip() {
   local nic="$1"
   local public_ip="$2"
-  local gateway connected_route
+  local gateway connected_route cidr prefix
+
+  cidr="$(cidr_for_nic_ip "$nic" "$public_ip")"
+  prefix=""
+  [[ -n "$cidr" ]] && prefix="$(cidr_prefix "$cidr")"
+
+  connected_route="$(connected_route_for_nic_ip "$nic" "$public_ip")"
+  if [[ "$prefix" == "32" ]]; then
+    if gateway="$(guess_gateway_for_connected_route "$connected_route" "$public_ip" 2>/dev/null)"; then
+      warn "Guessing gateway ${gateway} for ${public_ip} on ${nic} from ${connected_route}"
+      printf '%s\n' "$gateway"
+      return 0
+    fi
+  fi
 
   gateway="$(ip -4 route show table main default dev "$nic" 2>/dev/null | awk '/^default via / {print $3; exit}')"
   if [[ -n "$gateway" ]]; then
@@ -458,9 +481,8 @@ gateway_for_nic_ip() {
     return 0
   fi
 
-  connected_route="$(connected_route_for_nic_ip "$nic" "$public_ip")"
   if gateway="$(guess_gateway_for_connected_route "$connected_route" "$public_ip" 2>/dev/null)"; then
-    warn "Guessing gateway ${gateway} for ${public_ip} on ${nic} from ${connected_route}" >&2
+    warn "Guessing gateway ${gateway} for ${public_ip} on ${nic} from ${connected_route}"
     printf '%s\n' "$gateway"
     return 0
   fi
@@ -505,16 +527,21 @@ dump_public_route_debug() {
   fi
 }
 
+source_egress_matches_ip() {
+  local public_ip="$1"
+  local actual_ip
+
+  actual_ip="$(timeout 8 curl -4 --interface "$public_ip" -fsS https://api.ipify.org 2>/dev/null || true)"
+  [[ -n "$actual_ip" ]] || return 1
+  [[ "$actual_ip" == "$public_ip" ]]
+}
+
 apply_policy_route_for_public_ip() {
   local public_ip="$1"
   local nic="$2"
   local gateway connected_route table priority
 
   clear_policy_route_for_public_ip "$public_ip" "$nic"
-
-  if [[ "$nic" == "$PRIMARY_NIC" ]]; then
-    return 0
-  fi
 
   remove_ip_alias "$PRIMARY_NIC" "$public_ip"
 
@@ -541,17 +568,22 @@ apply_policy_route_for_public_ip() {
 
 ensure_source_route_for_ip() {
   local public_ip="$1"
-  local expected_nic route_line route_dev
+  local expected_nic route_line route_dev probe_ok=1
 
   expected_nic="$(resolve_nic_for_ip "$public_ip")"
   route_line="$(ip -4 route get 1.1.1.1 from "$public_ip" 2>/dev/null || true)"
   route_dev="$(route_dev_from_output "$route_line")"
 
-  if [[ "$route_dev" == "$expected_nic" ]]; then
+  if [[ "$route_dev" == "$expected_nic" ]] && source_egress_matches_ip "$public_ip"; then
     return 0
   fi
 
-  if [[ "$expected_nic" != "$PRIMARY_NIC" ]]; then
+  if ! source_egress_matches_ip "$public_ip"; then
+    probe_ok=0
+    route_debug "Egress probe for ${public_ip} failed or returned a different IP"
+  fi
+
+  if [[ "$expected_nic" != "$PRIMARY_NIC" || "$probe_ok" -eq 0 ]]; then
     warn "Source route for ${public_ip} exits via ${route_dev:-unknown}, attempting auto-fix on ${expected_nic}"
     dump_public_route_debug "$public_ip" "$expected_nic"
     apply_policy_route_for_public_ip "$public_ip" "$expected_nic"
@@ -564,6 +596,10 @@ ensure_source_route_for_ip() {
   if [[ "$route_dev" != "$expected_nic" ]]; then
     dump_public_route_debug "$public_ip" "$expected_nic"
     err "Source route for ${public_ip} exits via ${route_dev}, but ${public_ip} is bound to ${expected_nic}. Fix netplan/policy routing for this IP first."
+  fi
+  if ! source_egress_matches_ip "$public_ip"; then
+    dump_public_route_debug "$public_ip" "$expected_nic"
+    err "Source route for ${public_ip} looks correct, but egress probe still does not return ${public_ip}. Fix provider routing for this IP first."
   fi
 }
 
@@ -619,12 +655,17 @@ EOF
 
   for ip in "${IPS[@]}"; do
     nic="$(resolve_nic_for_ip "$ip")"
-    [[ "$nic" != "$PRIMARY_NIC" ]] || continue
 
-    connected_route="$(connected_route_for_nic_ip "$nic" "$ip")"
-    gateway="$(gateway_for_nic_ip "$nic" "$ip")"
     table="$(routing_table_id_for_public_ip "$ip" "$nic")"
     priority="$(routing_priority_for_public_ip "$ip" "$nic")"
+    connected_route="$(ip route show table "$table" 2>/dev/null | awk '!/^default/ {print $1; exit}')"
+    gateway="$(ip route show table "$table" 2>/dev/null | awk '/^default via / {print $3; exit}')"
+
+    if [[ -z "$connected_route" || -z "$gateway" ]]; then
+      [[ "$nic" != "$PRIMARY_NIC" ]] || continue
+      connected_route="$(connected_route_for_nic_ip "$nic" "$ip")"
+      gateway="$(gateway_for_nic_ip "$nic" "$ip")"
+    fi
 
     [[ -n "$connected_route" && -n "$gateway" ]] || continue
 
