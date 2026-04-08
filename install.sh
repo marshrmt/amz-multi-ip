@@ -658,7 +658,7 @@ apply_policy_route_for_vpn_ip() {
 write_public_ip_policy_route_service() {
   local script_path="$AMZ_PUBLIC_ROUTE_SCRIPT"
   local unit_path="/etc/systemd/system/${AMZ_PUBLIC_ROUTE_SERVICE}"
-  local ip nic connected_route gateway table priority
+  local ip nic connected_route gateway table priority cidr prefix
 
   cat >"$script_path" <<'EOF'
 #!/usr/bin/env bash
@@ -667,11 +667,18 @@ EOF
 
   for ip in "${IPS[@]}"; do
     nic="$(resolve_nic_for_ip "$ip")"
+    cidr="$(cidr_for_nic_ip "$nic" "$ip" || true)"
+    prefix=""
+    [[ -n "$cidr" ]] && prefix="$(cidr_prefix "$cidr")"
 
     table="$(routing_table_id_for_public_ip "$ip" "$nic")"
     priority="$(routing_priority_for_public_ip "$ip" "$nic")"
     connected_route="$( (ip route show table "$table" 2>/dev/null || true) | awk '!/^default/ {print $1; exit}' )"
     gateway="$( (ip route show table "$table" 2>/dev/null || true) | awk '/^default via / {print $3; exit}' )"
+
+    if [[ "$prefix" == "32" ]]; then
+      printf 'ip addr add %q dev %q 2>/dev/null || true\n' "${ip}/32" "$nic" >>"$script_path"
+    fi
 
     if [[ -z "$connected_route" || -z "$gateway" ]]; then
       [[ "$nic" != "$PRIMARY_NIC" ]] || continue
