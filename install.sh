@@ -28,6 +28,7 @@ SCRIPT_ARGS=()
 PRIMARY_NIC=""
 AMZ_PUBLIC_ROUTE_SCRIPT="/usr/local/sbin/amz-multi-public-routes.sh"
 AMZ_PUBLIC_ROUTE_SERVICE="amz-multi-public-routes.service"
+AMZ_PUBLIC_ROUTE_TIMER="amz-multi-public-routes.timer"
 AMZ_AWG_ROUTE_SCRIPT="/usr/local/sbin/amz-multi-awg-routes.sh"
 AMZ_AWG_ROUTE_SERVICE="amz-multi-awg-routes.service"
 
@@ -658,6 +659,7 @@ apply_policy_route_for_vpn_ip() {
 write_public_ip_policy_route_service() {
   local script_path="$AMZ_PUBLIC_ROUTE_SCRIPT"
   local unit_path="/etc/systemd/system/${AMZ_PUBLIC_ROUTE_SERVICE}"
+  local timer_path="/etc/systemd/system/${AMZ_PUBLIC_ROUTE_TIMER}"
   local ip nic connected_route gateway table priority cidr prefix
 
   cat >"$script_path" <<'EOF'
@@ -717,8 +719,23 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF
 
+  cat >"$timer_path" <<EOF
+[Unit]
+Description=Periodically re-apply amz-multi public IP aliases and routes
+
+[Timer]
+Unit=${AMZ_PUBLIC_ROUTE_SERVICE}
+OnBootSec=15s
+OnUnitActiveSec=30s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
+EOF
+
   systemctl daemon-reload
   systemctl enable --now "$AMZ_PUBLIC_ROUTE_SERVICE" >/dev/null 2>&1 || true
+  systemctl enable --now "$AMZ_PUBLIC_ROUTE_TIMER" >/dev/null 2>&1 || true
 
   return 0
 }
