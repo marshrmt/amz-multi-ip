@@ -230,7 +230,7 @@ cidr_for_nic_ip() {
   local nic="$1"
   local public_ip="$2"
   ip -o -4 addr show dev "$nic" scope global 2>/dev/null \
-    | awk -v ip="$public_ip" '$4 ~ ("^" ip "/") {print $4; exit}'
+    | awk -v ip="$public_ip" '{split($4, a, "/"); if (a[1] == ip) {print $4; exit}}'
 }
 
 network_from_cidr() {
@@ -256,7 +256,7 @@ network_from_cidr() {
 
 list_ip_bindings() {
   local ip="$1"
-  ip -o -4 addr show scope global 2>/dev/null | awk -v ip="$ip" '$4 ~ ("^" ip "/") {print $2 " " $4}'
+  ip -o -4 addr show scope global 2>/dev/null | awk -v ip="$ip" '{split($4, a, "/"); if (a[1] == ip) {print $2 " " $4}}'
 }
 
 network_file_for_nic() {
@@ -516,11 +516,11 @@ gateway_for_nic_ip() {
   local public_ip="$2"
   local gateway connected_route cidr prefix
 
-  cidr="$(cidr_for_nic_ip "$nic" "$public_ip")"
+  cidr="$(cidr_for_nic_ip "$nic" "$public_ip" || true)"
   prefix=""
-  [[ -n "$cidr" ]] && prefix="$(cidr_prefix "$cidr")"
+  [[ -n "$cidr" ]] && prefix="$(cidr_prefix "$cidr" || true)"
 
-  connected_route="$(connected_route_for_nic_ip "$nic" "$public_ip")"
+  connected_route="$(connected_route_for_nic_ip "$nic" "$public_ip" || true)"
   if [[ "$prefix" == "32" ]]; then
     if gateway="$(guess_gateway_for_connected_route "$connected_route" "$public_ip" 2>/dev/null)"; then
       warn "Guessing gateway ${gateway} for ${public_ip} on ${nic} from ${connected_route}"
@@ -596,7 +596,7 @@ ip_is_bound_to_nic() {
   local nic="$2"
 
   ip -o -4 addr show dev "$nic" scope global 2>/dev/null \
-    | awk -v ip="$public_ip" '$4 ~ ("^" ip "/") {found=1} END{exit found?0:1}'
+    | awk -v ip="$public_ip" '{split($4, a, "/"); if (a[1] == ip) found=1} END{exit found?0:1}'
 }
 
 write_public_ip_networkd_dropins() {
@@ -656,7 +656,9 @@ apply_policy_route_for_public_ip() {
 
   clear_policy_route_for_public_ip "$public_ip" "$nic"
 
-  remove_ip_alias "$PRIMARY_NIC" "$public_ip"
+  if [[ "$nic" != "$PRIMARY_NIC" ]]; then
+    remove_ip_alias "$PRIMARY_NIC" "$public_ip"
+  fi
 
   connected_route="$(connected_route_for_nic_ip "$nic" "$public_ip" || true)"
   [[ -n "$connected_route" ]] || err "Could not determine connected route for ${public_ip} on ${nic}"
@@ -810,7 +812,9 @@ EOF
       printf 'while ip rule del from %q table %q 2>/dev/null; do :; done\n' "${ip}/32" "$table"
       printf 'while ip rule del from %q 2>/dev/null; do :; done\n' "${ip}/32"
       printf 'ip route flush table %q 2>/dev/null || true\n' "$table"
-      printf 'ip addr del %q dev %q 2>/dev/null || true\n' "${ip}/32" "$PRIMARY_NIC"
+      if [[ "$nic" != "$PRIMARY_NIC" ]]; then
+        printf 'ip addr del %q dev %q 2>/dev/null || true\n' "${ip}/32" "$PRIMARY_NIC"
+      fi
       printf 'ip route replace %q dev %q src %q table %q 2>/dev/null || true\n' "$connected_route" "$nic" "$ip" "$table"
       printf 'ip route replace default via %q dev %q table %q 2>/dev/null || true\n' "$gateway" "$nic" "$table"
       printf 'ip rule add from %q table %q priority %q 2>/dev/null || true\n' "${ip}/32" "$table" "$priority"
