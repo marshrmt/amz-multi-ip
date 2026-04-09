@@ -259,6 +259,26 @@ list_ip_bindings() {
   ip -o -4 addr show scope global 2>/dev/null | awk -v ip="$ip" '$4 ~ ("^" ip "/") {print $2 " " $4}'
 }
 
+network_file_for_nic() {
+  local nic="$1"
+  networkctl status "$nic" --no-pager 2>/dev/null \
+    | sed -n 's/^[[:space:]]*Network File:[[:space:]]*//p' \
+    | head -n1
+}
+
+networkd_dropin_dir_for_nic() {
+  local nic="$1"
+  local network_file base_name
+
+  network_file="$(network_file_for_nic "$nic")"
+  [[ -n "$network_file" ]] || return 1
+
+  base_name="$(basename "$network_file")"
+  [[ -n "$base_name" ]] || return 1
+
+  printf '/etc/systemd/network/%s.d\n' "$base_name"
+}
+
 ip_exists_anywhere() {
   local ip="$1"
   list_ip_bindings "$ip" | grep -q .
@@ -555,6 +575,56 @@ ip_is_bound_to_nic() {
     | awk -v ip="$public_ip" '$4 ~ ("^" ip "/") {found=1} END{exit found?0:1}'
 }
 
+write_public_ip_networkd_dropins() {
+  local -A nics_with_aliases=()
+  local ip nic cidr prefix dropin_dir dropin_file network_file
+
+  log "Configuring native systemd-networkd address persistence where available"
+
+  for ip in "${IPS[@]}"; do
+    nic="$(resolve_nic_for_ip "$ip")"
+    cidr="$(cidr_for_nic_ip "$nic" "$ip" || true)"
+    prefix=""
+    [[ -n "$cidr" ]] && prefix="$(cidr_prefix "$cidr")"
+
+    if [[ "$prefix" == "32" ]]; then
+      nics_with_aliases["$nic"]=1
+    fi
+  done
+
+  for nic in "${!nics_with_aliases[@]}"; do
+    network_file="$(network_file_for_nic "$nic" || true)"
+    dropin_dir="$(networkd_dropin_dir_for_nic "$nic" || true)"
+
+    if [[ -z "$dropin_dir" ]]; then
+      warn "Could not determine systemd-networkd base file for ${nic}; keeping dispatcher fallback only"
+      continue
+    fi
+
+    mkdir -p "$dropin_dir"
+    dropin_file="${dropin_dir}/50-amz-multi-addresses.conf"
+
+    {
+      printf '[Network]\n'
+      for ip in "${IPS[@]}"; do
+        if [[ "$(resolve_nic_for_ip "$ip")" != "$nic" ]]; then
+          continue
+        fi
+
+        cidr="$(cidr_for_nic_ip "$nic" "$ip" || true)"
+        prefix=""
+        [[ -n "$cidr" ]] && prefix="$(cidr_prefix "$cidr")"
+        [[ "$prefix" == "32" ]] || continue
+
+        printf 'Address=%s/32\n' "$ip"
+      done
+    } >"$dropin_file"
+
+    chmod 644 "$dropin_file"
+    log "Installed native address drop-in ${dropin_file} for ${nic} (base ${network_file:-unknown})"
+  done
+}
+
 apply_policy_route_for_public_ip() {
   local public_ip="$1"
   local nic="$2"
@@ -764,7 +834,7 @@ EOF
 
 validate_public_ip_persistence() {
   local failures=0
-  local ip nic route_line route_dev route_via alias_state route_state egress_state
+  local ip nic route_line route_dev route_via alias_state route_state egress_state cidr prefix dropin_dir dropin_file native_state
 
   log "Validating public IP persistence"
 
@@ -798,12 +868,16 @@ validate_public_ip_persistence() {
 
   for ip in "${IPS[@]}"; do
     nic="$(resolve_nic_for_ip "$ip")"
+    cidr="$(cidr_for_nic_ip "$nic" "$ip" || true)"
+    prefix=""
+    [[ -n "$cidr" ]] && prefix="$(cidr_prefix "$cidr")"
     route_line="$(ip -4 route get 1.1.1.1 from "$ip" 2>/dev/null || true)"
     route_dev="$(route_dev_from_output "$route_line")"
     route_via="$(route_via_from_output "$route_line")"
     alias_state="ok"
     route_state="ok"
     egress_state="ok"
+    native_state="n/a"
 
     if ! ip_is_bound_to_nic "$ip" "$nic"; then
       alias_state="missing"
@@ -820,10 +894,22 @@ validate_public_ip_persistence() {
       failures=1
     fi
 
-    if [[ "$alias_state" == "ok" && "$route_state" == "ok" && "$egress_state" == "ok" ]]; then
-      log "Persistence check OK: ${ip} on ${nic} via ${route_via:-direct}"
+    if [[ "$prefix" == "32" ]]; then
+      dropin_dir="$(networkd_dropin_dir_for_nic "$nic" || true)"
+      dropin_file="${dropin_dir}/50-amz-multi-addresses.conf"
+
+      if [[ -n "$dropin_dir" && -f "$dropin_file" ]] && grep -qxF "Address=${ip}/32" "$dropin_file"; then
+        native_state="ok"
+      else
+        native_state="missing"
+        failures=1
+      fi
+    fi
+
+    if [[ "$alias_state" == "ok" && "$route_state" == "ok" && "$egress_state" == "ok" && "$native_state" != "missing" ]]; then
+      log "Persistence check OK: ${ip} on ${nic} via ${route_via:-direct} native=${native_state}"
     else
-      warn "Persistence check FAILED: ${ip} on ${nic} alias=${alias_state} route=${route_state} via=${route_via:-none} egress=${egress_state}"
+      warn "Persistence check FAILED: ${ip} on ${nic} alias=${alias_state} route=${route_state} via=${route_via:-none} egress=${egress_state} native=${native_state}"
     fi
   done
 
@@ -2084,6 +2170,7 @@ main() {
   log "Checking source routing for requested IPs"
   validate_source_routes_for_ips
   log "Source routing checks completed"
+  write_public_ip_networkd_dropins
   write_public_ip_policy_route_service
   log "Source routing persistence prepared"
   validate_public_ip_persistence
