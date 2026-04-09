@@ -37,6 +37,8 @@ AMZ_AWG_ROUTE_SERVICE="amz-multi-awg-routes.service"
 declare -Ag RESOLVED_IP_NICS=()
 declare -Ag PUBLIC_IP_TABLE_IDS=()
 declare -Ag PUBLIC_IP_PRIORITIES=()
+declare -Ag EGRESS_PROBE_VALUES=()
+declare -Ag EGRESS_PROBE_DONE=()
 
 usage() {
   cat <<'EOF'
@@ -648,11 +650,32 @@ dump_public_route_debug() {
 
 source_egress_matches_ip() {
   local public_ip="$1"
+  local force="${2:-0}"
   local actual_ip
 
-  actual_ip="$(timeout 8 curl -4 --interface "$public_ip" -fsS https://api.ipify.org 2>/dev/null || true)"
+  if [[ "$force" != "1" && -n "${EGRESS_PROBE_DONE[$public_ip]+x}" ]]; then
+    actual_ip="${EGRESS_PROBE_VALUES[$public_ip]}"
+    [[ -n "$actual_ip" ]] || return 1
+    [[ "$actual_ip" == "$public_ip" ]]
+    return
+  fi
+
+  actual_ip="$(
+    timeout 3 curl -4 --interface "$public_ip" \
+      --connect-timeout 1 \
+      --max-time 2 \
+      -fsS https://api.ipify.org 2>/dev/null || true
+  )"
+  EGRESS_PROBE_VALUES["$public_ip"]="$actual_ip"
+  EGRESS_PROBE_DONE["$public_ip"]=1
   [[ -n "$actual_ip" ]] || return 1
   [[ "$actual_ip" == "$public_ip" ]]
+}
+
+invalidate_source_egress_probe() {
+  local public_ip="$1"
+  unset 'EGRESS_PROBE_VALUES[$public_ip]' || true
+  unset 'EGRESS_PROBE_DONE[$public_ip]' || true
 }
 
 ip_is_bound_to_nic() {
@@ -761,14 +784,13 @@ ensure_source_route_for_ip() {
   fi
   route_line="$(ip -4 route get 1.1.1.1 from "$public_ip" 2>/dev/null || true)"
   route_dev="$(route_dev_from_output "$route_line")"
-
-  if [[ "$route_dev" == "$expected_nic" ]] && source_egress_matches_ip "$public_ip"; then
-    return 0
-  fi
-
   if ! source_egress_matches_ip "$public_ip"; then
     probe_ok=0
     route_debug "Egress probe for ${public_ip} failed or returned a different IP"
+  fi
+
+  if [[ "$route_dev" == "$expected_nic" && "$probe_ok" -eq 1 ]]; then
+    return 0
   fi
 
   if [[ "$requires_policy" -eq 1 || "$probe_ok" -eq 0 ]]; then
@@ -777,6 +799,12 @@ ensure_source_route_for_ip() {
     apply_policy_route_for_public_ip "$public_ip" "$expected_nic"
     route_line="$(ip -4 route get 1.1.1.1 from "$public_ip" 2>/dev/null || true)"
     route_dev="$(route_dev_from_output "$route_line")"
+    invalidate_source_egress_probe "$public_ip"
+    probe_ok=1
+    if ! source_egress_matches_ip "$public_ip" 1; then
+      probe_ok=0
+      route_debug "Egress probe for ${public_ip} still failed after auto-fix"
+    fi
     route_debug "After auto-fix, route for ${public_ip}: ${route_line:-<empty>}"
   fi
 
@@ -785,7 +813,7 @@ ensure_source_route_for_ip() {
     dump_public_route_debug "$public_ip" "$expected_nic"
     err "Source route for ${public_ip} exits via ${route_dev}, but ${public_ip} is bound to ${expected_nic}. Fix netplan/policy routing for this IP first."
   fi
-  if ! source_egress_matches_ip "$public_ip"; then
+  if [[ "$probe_ok" -eq 0 ]]; then
     dump_public_route_debug "$public_ip" "$expected_nic"
     err "Source route for ${public_ip} looks correct, but egress probe still does not return ${public_ip}. Fix provider routing for this IP first."
   fi
