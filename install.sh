@@ -136,8 +136,7 @@ ensure_pkgs() {
   apt-get update -y
   apt-get install -y \
     curl wget jq iptables iptables-persistent ca-certificates \
-    openssl uuid-runtime unzip tar perl qrencode netcat-openbsd \
-    networkd-dispatcher
+    openssl uuid-runtime unzip tar perl qrencode netcat-openbsd
 }
 
 make_dirs() {
@@ -868,9 +867,11 @@ write_public_ip_policy_route_service() {
   local unit_path="/etc/systemd/system/${AMZ_PUBLIC_ROUTE_SERVICE}"
   local timer_path="/etc/systemd/system/${AMZ_PUBLIC_ROUTE_TIMER}"
   local hook_path="$AMZ_PUBLIC_ROUTE_HOOK"
+  local networkd_wants_dir="/etc/systemd/system/systemd-networkd.service.wants"
+  local networkd_wants_link="${networkd_wants_dir}/${AMZ_PUBLIC_ROUTE_SERVICE}"
   local ip nic connected_route gateway table priority cidr prefix
 
-  log "Configuring public IP persistence via networkd-dispatcher"
+  log "Configuring public IP persistence via systemd-networkd"
 
   cat >"$script_path" <<'EOF'
 #!/usr/bin/env bash
@@ -931,8 +932,8 @@ EOF
   cat >"$unit_path" <<EOF
 [Unit]
 Description=amz-multi public IP policy routes
-After=network-online.target
-Wants=network-online.target
+After=systemd-networkd.service
+PartOf=systemd-networkd.service
 
 [Service]
 Type=oneshot
@@ -940,16 +941,13 @@ ExecStart=${script_path}
 
 [Install]
 WantedBy=multi-user.target
+WantedBy=systemd-networkd.service
 EOF
 
-  mkdir -p "$(dirname "$hook_path")"
-  cat >"$hook_path" <<EOF
-#!/usr/bin/env bash
-set -Eeuo pipefail
-exec ${script_path}
-EOF
-  chmod 700 "$hook_path"
-  log "Installed networkd-dispatcher hook ${hook_path}"
+  if [[ -f "$hook_path" ]]; then
+    log "Removing legacy networkd-dispatcher hook ${hook_path}"
+    rm -f "$hook_path"
+  fi
 
   if [[ -f "$timer_path" ]]; then
     log "Removing legacy timer-based persistence ${AMZ_PUBLIC_ROUTE_TIMER}"
@@ -957,8 +955,10 @@ EOF
   systemctl disable --now "$AMZ_PUBLIC_ROUTE_TIMER" >/dev/null 2>&1 || true
   rm -f "$timer_path"
   systemctl daemon-reload
-  systemctl enable --now "$AMZ_PUBLIC_ROUTE_SERVICE" >/dev/null 2>&1 || true
-  systemctl enable --now networkd-dispatcher.service >/dev/null 2>&1 || true
+  mkdir -p "$networkd_wants_dir"
+  systemctl enable "$AMZ_PUBLIC_ROUTE_SERVICE" >/dev/null 2>&1 || true
+  ln -sf "$unit_path" "$networkd_wants_link"
+  log "Installed systemd-networkd restart trigger ${networkd_wants_link}"
   log "Applying public IP persistence immediately"
   systemctl restart "$AMZ_PUBLIC_ROUTE_SERVICE" >/dev/null 2>&1 || err "Failed to run ${AMZ_PUBLIC_ROUTE_SERVICE}"
 
@@ -968,6 +968,7 @@ EOF
 validate_public_ip_persistence() {
   local failures=0
   local ip nic route_line route_dev route_via alias_state route_state egress_state cidr prefix dropin_dir dropin_file native_state
+  local networkd_wants_link="/etc/systemd/system/systemd-networkd.service.wants/${AMZ_PUBLIC_ROUTE_SERVICE}"
 
   log "Validating public IP persistence"
 
@@ -978,13 +979,6 @@ validate_public_ip_persistence() {
     failures=1
   fi
 
-  if [[ -x "$AMZ_PUBLIC_ROUTE_HOOK" ]]; then
-    log "networkd-dispatcher hook is present: ${AMZ_PUBLIC_ROUTE_HOOK}"
-  else
-    warn "networkd-dispatcher hook is missing or not executable: ${AMZ_PUBLIC_ROUTE_HOOK}"
-    failures=1
-  fi
-
   if systemctl is-enabled "$AMZ_PUBLIC_ROUTE_SERVICE" >/dev/null 2>&1; then
     log "Persistence service is enabled: ${AMZ_PUBLIC_ROUTE_SERVICE}"
   else
@@ -992,10 +986,10 @@ validate_public_ip_persistence() {
     failures=1
   fi
 
-  if systemctl is-active --quiet networkd-dispatcher.service; then
-    log "networkd-dispatcher is active"
+  if [[ -L "$networkd_wants_link" ]]; then
+    log "systemd-networkd restart trigger is present: ${networkd_wants_link}"
   else
-    warn "networkd-dispatcher is not active"
+    warn "systemd-networkd restart trigger is missing: ${networkd_wants_link}"
     failures=1
   fi
 
