@@ -37,6 +37,9 @@ AMZ_AWG_ROUTE_SERVICE="amz-multi-awg-routes.service"
 declare -Ag RESOLVED_IP_NICS=()
 declare -Ag PUBLIC_IP_TABLE_IDS=()
 declare -Ag PUBLIC_IP_PRIORITIES=()
+declare -Ag PUBLIC_IP_POLICY_REQUIRED=()
+declare -Ag PUBLIC_IP_EFFECTIVE_GATEWAYS=()
+declare -Ag PUBLIC_IP_EFFECTIVE_CONNECTED_ROUTES=()
 declare -Ag EGRESS_PROBE_VALUES=()
 declare -Ag EGRESS_PROBE_DONE=()
 
@@ -371,6 +374,9 @@ build_public_ip_route_maps() {
 
   PUBLIC_IP_TABLE_IDS=()
   PUBLIC_IP_PRIORITIES=()
+  PUBLIC_IP_POLICY_REQUIRED=()
+  PUBLIC_IP_EFFECTIVE_GATEWAYS=()
+  PUBLIC_IP_EFFECTIVE_CONNECTED_ROUTES=()
 
   for ip in "${IPS[@]}"; do
     PUBLIC_IP_TABLE_IDS["$ip"]="$((2000 + index))"
@@ -423,6 +429,11 @@ public_ip_requires_policy_route() {
   local nic="${2:-$(resolve_nic_for_ip "$public_ip")}"
   local cidr prefix=""
 
+  if [[ -n "${PUBLIC_IP_POLICY_REQUIRED[$public_ip]+x}" ]]; then
+    [[ "${PUBLIC_IP_POLICY_REQUIRED[$public_ip]}" == "1" ]]
+    return
+  fi
+
   if public_ip_is_primary_ip "$public_ip"; then
     return 1
   fi
@@ -439,6 +450,37 @@ public_ip_requires_policy_route() {
   fi
 
   return 1
+}
+
+record_public_ip_runtime_strategy() {
+  local public_ip="$1"
+  local nic="$2"
+  local route_line route_via connected_route main_gateway
+
+  route_line="$(ip -4 route get 1.1.1.1 from "$public_ip" 2>/dev/null || true)"
+  route_via="$(route_via_from_output "$route_line")"
+  connected_route="$(connected_route_for_nic_ip "$nic" "$public_ip" || true)"
+  main_gateway="$(ip -4 route show table main default dev "$PRIMARY_NIC" 2>/dev/null | awk '/^default via / {print $3; exit}')"
+
+  PUBLIC_IP_EFFECTIVE_GATEWAYS["$public_ip"]="$route_via"
+  PUBLIC_IP_EFFECTIVE_CONNECTED_ROUTES["$public_ip"]="$connected_route"
+
+  if public_ip_is_primary_ip "$public_ip"; then
+    PUBLIC_IP_POLICY_REQUIRED["$public_ip"]=0
+    return 0
+  fi
+
+  if [[ "$nic" != "$PRIMARY_NIC" ]]; then
+    PUBLIC_IP_POLICY_REQUIRED["$public_ip"]=1
+    return 0
+  fi
+
+  if [[ -n "$route_via" && -n "$main_gateway" && "$route_via" != "$main_gateway" ]]; then
+    PUBLIC_IP_POLICY_REQUIRED["$public_ip"]=1
+    return 0
+  fi
+
+  PUBLIC_IP_POLICY_REQUIRED["$public_ip"]=0
 }
 
 routing_table_id_for_public_ip() {
@@ -775,12 +817,14 @@ apply_policy_route_for_public_ip() {
 
 ensure_source_route_for_ip() {
   local public_ip="$1"
-  local expected_nic route_line route_dev probe_ok=1 requires_policy=1
+  local expected_nic route_line route_dev probe_ok=1 requires_policy=1 cidr prefix=""
 
   expected_nic="$(resolve_nic_for_ip "$public_ip")"
   if ! public_ip_requires_policy_route "$public_ip" "$expected_nic"; then
     requires_policy=0
   fi
+  cidr="$(cidr_for_nic_ip "$expected_nic" "$public_ip" || true)"
+  [[ -n "$cidr" ]] && prefix="$(cidr_prefix "$cidr" || true)"
   route_line="$(ip -4 route get 1.1.1.1 from "$public_ip" 2>/dev/null || true)"
   route_dev="$(route_dev_from_output "$route_line")"
   if ! source_egress_matches_ip "$public_ip"; then
@@ -789,7 +833,30 @@ ensure_source_route_for_ip() {
   fi
 
   if [[ "$route_dev" == "$expected_nic" && "$probe_ok" -eq 1 ]]; then
+    record_public_ip_runtime_strategy "$public_ip" "$expected_nic"
     return 0
+  fi
+
+  if [[ "$expected_nic" == "$PRIMARY_NIC" && "$prefix" == "32" ]]; then
+    route_debug "Testing main-path fallback for ${public_ip} on ${expected_nic} before applying a dedicated policy route"
+    clear_policy_route_for_public_ip "$public_ip" "$expected_nic"
+    ip route flush cache
+    invalidate_source_egress_probe "$public_ip"
+    route_line="$(ip -4 route get 1.1.1.1 from "$public_ip" 2>/dev/null || true)"
+    route_dev="$(route_dev_from_output "$route_line")"
+
+    if [[ "$route_dev" == "$expected_nic" ]] && source_egress_matches_ip "$public_ip" 1; then
+      route_debug "${public_ip} works via main-path fallback; dedicated policy route is not required"
+      PUBLIC_IP_POLICY_REQUIRED["$public_ip"]=0
+      record_public_ip_runtime_strategy "$public_ip" "$expected_nic"
+      return 0
+    fi
+
+    probe_ok=1
+    if ! source_egress_matches_ip "$public_ip"; then
+      probe_ok=0
+    fi
+    route_debug "${public_ip} still does not work via main-path fallback; dedicated policy route will be applied"
   fi
 
   if [[ "$requires_policy" -eq 1 || "$probe_ok" -eq 0 ]]; then
@@ -816,6 +883,8 @@ ensure_source_route_for_ip() {
     dump_public_route_debug "$public_ip" "$expected_nic"
     err "Source route for ${public_ip} looks correct, but egress probe still does not return ${public_ip}. Fix provider routing for this IP first."
   fi
+
+  record_public_ip_runtime_strategy "$public_ip" "$expected_nic"
 
   return 0
 }
@@ -886,8 +955,8 @@ EOF
 
     table="$(routing_table_id_for_public_ip "$ip" "$nic")"
     priority="$(routing_priority_for_public_ip "$ip" "$nic")"
-    connected_route="$( (ip route show table "$table" 2>/dev/null || true) | awk '!/^default/ {print $1; exit}' )"
-    gateway="$( (ip route show table "$table" 2>/dev/null || true) | awk '/^default via / {print $3; exit}' )"
+    connected_route="${PUBLIC_IP_EFFECTIVE_CONNECTED_ROUTES[$ip]:-}"
+    gateway="${PUBLIC_IP_EFFECTIVE_GATEWAYS[$ip]:-}"
 
     if [[ "$prefix" == "32" ]]; then
       log "Persistence: will restore alias ${ip}/32 on ${nic}"
@@ -899,6 +968,11 @@ EOF
     if ! public_ip_requires_policy_route "$ip" "$nic"; then
       log "Persistence: ${ip} does not need a dedicated source route on ${nic}; main path is left untouched"
       continue
+    fi
+
+    if [[ -z "$connected_route" || -z "$gateway" ]]; then
+      connected_route="$( (ip route show table "$table" 2>/dev/null || true) | awk '!/^default/ {print $1; exit}' )"
+      gateway="$( (ip route show table "$table" 2>/dev/null || true) | awk '/^default via / {print $3; exit}' )"
     fi
 
     if [[ -z "$connected_route" || -z "$gateway" ]]; then
