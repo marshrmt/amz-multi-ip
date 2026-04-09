@@ -35,6 +35,8 @@ AMZ_AWG_ROUTE_SCRIPT="/usr/local/sbin/amz-multi-awg-routes.sh"
 AMZ_AWG_ROUTE_SERVICE="amz-multi-awg-routes.service"
 
 declare -Ag RESOLVED_IP_NICS=()
+declare -Ag PUBLIC_IP_TABLE_IDS=()
+declare -Ag PUBLIC_IP_PRIORITIES=()
 
 usage() {
   cat <<'EOF'
@@ -363,6 +365,19 @@ ensure_ip_aliases() {
   done
 }
 
+build_public_ip_route_maps() {
+  local ip index=1
+
+  PUBLIC_IP_TABLE_IDS=()
+  PUBLIC_IP_PRIORITIES=()
+
+  for ip in "${IPS[@]}"; do
+    PUBLIC_IP_TABLE_IDS["$ip"]="$((2000 + index))"
+    PUBLIC_IP_PRIORITIES["$ip"]="$((1000 + index))"
+    index=$((index + 1))
+  done
+}
+
 remove_ip_alias() {
   local nic="$1"
   local ip="$2"
@@ -428,15 +443,27 @@ public_ip_requires_policy_route() {
 routing_table_id_for_public_ip() {
   local public_ip="$1"
   local route_key
+
+  if [[ -n "${PUBLIC_IP_TABLE_IDS[$public_ip]+x}" ]]; then
+    printf '%s\n' "${PUBLIC_IP_TABLE_IDS[$public_ip]}"
+    return 0
+  fi
+
   route_key="$(public_ip_route_key "$public_ip")"
-  printf '%s\n' "$((100000 + route_key))"
+  printf '%s\n' "$((2000 + (route_key % 20000)))"
 }
 
 routing_priority_for_public_ip() {
   local public_ip="$1"
   local route_key
+
+  if [[ -n "${PUBLIC_IP_PRIORITIES[$public_ip]+x}" ]]; then
+    printf '%s\n' "${PUBLIC_IP_PRIORITIES[$public_ip]}"
+    return 0
+  fi
+
   route_key="$(public_ip_route_key "$public_ip")"
-  printf '%s\n' "$((200000 + route_key))"
+  printf '%s\n' "$((1000 + (route_key % 20000)))"
 }
 
 clear_policy_route_for_public_ip() {
@@ -2244,6 +2271,7 @@ main() {
   require_root
   parse_args "$@"
   split_ips
+  build_public_ip_route_maps
   make_dirs
   init_state
   ensure_pkgs
