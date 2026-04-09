@@ -29,6 +29,7 @@ PRIMARY_NIC=""
 AMZ_PUBLIC_ROUTE_SCRIPT="/usr/local/sbin/amz-multi-public-routes.sh"
 AMZ_PUBLIC_ROUTE_SERVICE="amz-multi-public-routes.service"
 AMZ_PUBLIC_ROUTE_TIMER="amz-multi-public-routes.timer"
+AMZ_PUBLIC_ROUTE_HOOK="/etc/networkd-dispatcher/routable.d/50-amz-multi-public-routes"
 AMZ_AWG_ROUTE_SCRIPT="/usr/local/sbin/amz-multi-awg-routes.sh"
 AMZ_AWG_ROUTE_SERVICE="amz-multi-awg-routes.service"
 
@@ -126,7 +127,8 @@ ensure_pkgs() {
   apt-get update -y
   apt-get install -y \
     curl wget jq iptables iptables-persistent ca-certificates \
-    openssl uuid-runtime unzip tar perl qrencode netcat-openbsd
+    openssl uuid-runtime unzip tar perl qrencode netcat-openbsd \
+    networkd-dispatcher
 }
 
 make_dirs() {
@@ -545,6 +547,14 @@ source_egress_matches_ip() {
   [[ "$actual_ip" == "$public_ip" ]]
 }
 
+ip_is_bound_to_nic() {
+  local public_ip="$1"
+  local nic="$2"
+
+  ip -o -4 addr show dev "$nic" scope global 2>/dev/null \
+    | awk -v ip="$public_ip" '$4 ~ ("^" ip "/") {found=1} END{exit found?0:1}'
+}
+
 apply_policy_route_for_public_ip() {
   local public_ip="$1"
   local nic="$2"
@@ -660,7 +670,10 @@ write_public_ip_policy_route_service() {
   local script_path="$AMZ_PUBLIC_ROUTE_SCRIPT"
   local unit_path="/etc/systemd/system/${AMZ_PUBLIC_ROUTE_SERVICE}"
   local timer_path="/etc/systemd/system/${AMZ_PUBLIC_ROUTE_TIMER}"
+  local hook_path="$AMZ_PUBLIC_ROUTE_HOOK"
   local ip nic connected_route gateway table priority cidr prefix
+
+  log "Configuring public IP persistence via networkd-dispatcher"
 
   cat >"$script_path" <<'EOF'
 #!/usr/bin/env bash
@@ -679,7 +692,10 @@ EOF
     gateway="$( (ip route show table "$table" 2>/dev/null || true) | awk '/^default via / {print $3; exit}' )"
 
     if [[ "$prefix" == "32" ]]; then
+      log "Persistence: will restore alias ${ip}/32 on ${nic}"
       printf 'ip addr add %q dev %q 2>/dev/null || true\n' "${ip}/32" "$nic" >>"$script_path"
+    else
+      log "Persistence: ${ip} already has native prefix on ${nic} (${cidr})"
     fi
 
     if [[ -z "$connected_route" || -z "$gateway" ]]; then
@@ -688,7 +704,12 @@ EOF
       gateway="$(gateway_for_nic_ip "$nic" "$ip" || true)"
     fi
 
-    [[ -n "$connected_route" && -n "$gateway" ]] || continue
+    if [[ -z "$connected_route" || -z "$gateway" ]]; then
+      log "Persistence: ${ip} does not need a dedicated source route on ${nic}"
+      continue
+    fi
+
+    log "Persistence: will restore route for ${ip} via ${gateway} on ${nic} (table ${table}, priority ${priority}, connected ${connected_route})"
 
     {
       printf 'while ip rule del from %q table %q priority %q 2>/dev/null; do :; done\n' "${ip}/32" "$table" "$priority"
@@ -713,31 +734,104 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=${script_path}
-RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-  cat >"$timer_path" <<EOF
-[Unit]
-Description=Periodically re-apply amz-multi public IP aliases and routes
-
-[Timer]
-Unit=${AMZ_PUBLIC_ROUTE_SERVICE}
-OnBootSec=15s
-OnUnitActiveSec=30s
-AccuracySec=5s
-
-[Install]
-WantedBy=timers.target
+  mkdir -p "$(dirname "$hook_path")"
+  cat >"$hook_path" <<EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
+exec ${script_path}
 EOF
+  chmod 700 "$hook_path"
+  log "Installed networkd-dispatcher hook ${hook_path}"
 
+  if [[ -f "$timer_path" ]]; then
+    log "Removing legacy timer-based persistence ${AMZ_PUBLIC_ROUTE_TIMER}"
+  fi
+  systemctl disable --now "$AMZ_PUBLIC_ROUTE_TIMER" >/dev/null 2>&1 || true
+  rm -f "$timer_path"
   systemctl daemon-reload
   systemctl enable --now "$AMZ_PUBLIC_ROUTE_SERVICE" >/dev/null 2>&1 || true
-  systemctl enable --now "$AMZ_PUBLIC_ROUTE_TIMER" >/dev/null 2>&1 || true
+  systemctl enable --now networkd-dispatcher.service >/dev/null 2>&1 || true
+  log "Applying public IP persistence immediately"
+  systemctl restart "$AMZ_PUBLIC_ROUTE_SERVICE" >/dev/null 2>&1 || err "Failed to run ${AMZ_PUBLIC_ROUTE_SERVICE}"
 
   return 0
+}
+
+validate_public_ip_persistence() {
+  local failures=0
+  local ip nic route_line route_dev route_via alias_state route_state egress_state
+
+  log "Validating public IP persistence"
+
+  if [[ -x "$AMZ_PUBLIC_ROUTE_SCRIPT" ]]; then
+    log "Persistence script is present: ${AMZ_PUBLIC_ROUTE_SCRIPT}"
+  else
+    warn "Persistence script is missing or not executable: ${AMZ_PUBLIC_ROUTE_SCRIPT}"
+    failures=1
+  fi
+
+  if [[ -x "$AMZ_PUBLIC_ROUTE_HOOK" ]]; then
+    log "networkd-dispatcher hook is present: ${AMZ_PUBLIC_ROUTE_HOOK}"
+  else
+    warn "networkd-dispatcher hook is missing or not executable: ${AMZ_PUBLIC_ROUTE_HOOK}"
+    failures=1
+  fi
+
+  if systemctl is-enabled "$AMZ_PUBLIC_ROUTE_SERVICE" >/dev/null 2>&1; then
+    log "Persistence service is enabled: ${AMZ_PUBLIC_ROUTE_SERVICE}"
+  else
+    warn "Persistence service is not enabled: ${AMZ_PUBLIC_ROUTE_SERVICE}"
+    failures=1
+  fi
+
+  if systemctl is-active --quiet networkd-dispatcher.service; then
+    log "networkd-dispatcher is active"
+  else
+    warn "networkd-dispatcher is not active"
+    failures=1
+  fi
+
+  for ip in "${IPS[@]}"; do
+    nic="$(resolve_nic_for_ip "$ip")"
+    route_line="$(ip -4 route get 1.1.1.1 from "$ip" 2>/dev/null || true)"
+    route_dev="$(route_dev_from_output "$route_line")"
+    route_via="$(route_via_from_output "$route_line")"
+    alias_state="ok"
+    route_state="ok"
+    egress_state="ok"
+
+    if ! ip_is_bound_to_nic "$ip" "$nic"; then
+      alias_state="missing"
+      failures=1
+    fi
+
+    if [[ -z "$route_dev" || "$route_dev" != "$nic" ]]; then
+      route_state="bad(${route_dev:-none})"
+      failures=1
+    fi
+
+    if ! source_egress_matches_ip "$ip"; then
+      egress_state="bad"
+      failures=1
+    fi
+
+    if [[ "$alias_state" == "ok" && "$route_state" == "ok" && "$egress_state" == "ok" ]]; then
+      log "Persistence check OK: ${ip} on ${nic} via ${route_via:-direct}"
+    else
+      warn "Persistence check FAILED: ${ip} on ${nic} alias=${alias_state} route=${route_state} via=${route_via:-none} egress=${egress_state}"
+    fi
+  done
+
+  if [[ "$failures" -ne 0 ]]; then
+    err "Public IP persistence validation failed"
+  fi
+
+  log "Public IP persistence is healthy"
 }
 
 write_awg_policy_route_service() {
@@ -1992,6 +2086,7 @@ main() {
   log "Source routing checks completed"
   write_public_ip_policy_route_service
   log "Source routing persistence prepared"
+  validate_public_ip_persistence
 
   if [[ "$PROTO" == "both" ]]; then
     ensure_awg_port_saved
