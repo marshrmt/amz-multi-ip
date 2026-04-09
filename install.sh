@@ -449,21 +449,45 @@ clear_policy_route_for_vpn_ip() {
 connected_route_for_nic_ip() {
   local nic="$1"
   local public_ip="$2"
-  local cidr prefix
+  local cidr prefix candidate=""
 
-  cidr="$(cidr_for_nic_ip "$nic" "$public_ip")"
+  cidr="$(cidr_for_nic_ip "$nic" "$public_ip" || true)"
   if [[ -n "$cidr" ]]; then
-    prefix="$(cidr_prefix "$cidr")"
+    prefix="$(cidr_prefix "$cidr" || true)"
     if [[ "$prefix" == "32" ]]; then
-      network_from_cidr "${public_ip%.*}.0/24"
+      printf '%s\n' "${public_ip%.*}.0/24"
       return 0
     fi
-    network_from_cidr "$cidr"
+
+    candidate="$(network_from_cidr "$cidr" 2>/dev/null || true)"
+    if [[ -n "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  fi
+
+  candidate="$(
+    ip -4 route show table main dev "$nic" proto kernel scope link 2>/dev/null \
+      | awk -v src="$public_ip" '$0 ~ (" src " src "($| )") {print $1; exit}'
+  )"
+  if [[ -n "$candidate" ]]; then
+    printf '%s\n' "$candidate"
     return 0
   fi
 
-  ip -4 route show table main dev "$nic" proto kernel scope link 2>/dev/null \
-    | awk -v src="$public_ip" '$0 ~ (" src " src "($| )") {print $1; exit}'
+  candidate="$(
+    ip -o -4 addr show dev "$nic" scope global 2>/dev/null \
+      | awk '$4 !~ /\/32$/ {print $4; exit}'
+  )"
+  if [[ -n "$candidate" ]]; then
+    candidate="$(network_from_cidr "$candidate" 2>/dev/null || true)"
+    if [[ -n "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  fi
+
+  return 1
 }
 
 guess_gateway_for_connected_route() {
@@ -634,7 +658,7 @@ apply_policy_route_for_public_ip() {
 
   remove_ip_alias "$PRIMARY_NIC" "$public_ip"
 
-  connected_route="$(connected_route_for_nic_ip "$nic" "$public_ip")"
+  connected_route="$(connected_route_for_nic_ip "$nic" "$public_ip" || true)"
   [[ -n "$connected_route" ]] || err "Could not determine connected route for ${public_ip} on ${nic}"
 
   gateway="$(gateway_for_nic_ip "$nic" "$public_ip")" \
@@ -965,8 +989,18 @@ clear_all_amz_awg_policy_routes() {
 connected_route_for_nic_ip() {
   local nic="$1"
   local public_ip="$2"
-  ip -4 route show table main dev "$nic" proto kernel scope link 2>/dev/null \
-    | awk -v src="$public_ip" '$0 ~ (" src " src "($| )") {print $1; exit}'
+  local candidate=""
+
+  candidate="$(
+    ip -4 route show table main dev "$nic" proto kernel scope link 2>/dev/null \
+      | awk -v src="$public_ip" '$0 ~ (" src " src "($| )") {print $1; exit}'
+  )"
+  if [[ -n "$candidate" ]]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+
+  printf '%s\n' "${public_ip%.*}.0/24"
 }
 
 apply_route() {
