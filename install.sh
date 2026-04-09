@@ -26,6 +26,7 @@ AWG_SETUP_STATE_FILE="${AWG_DIR}/setup_state"
 
 SCRIPT_ARGS=()
 PRIMARY_NIC=""
+PRIMARY_IP=""
 AMZ_PUBLIC_ROUTE_SCRIPT="/usr/local/sbin/amz-multi-public-routes.sh"
 AMZ_PUBLIC_ROUTE_SERVICE="amz-multi-public-routes.service"
 AMZ_PUBLIC_ROUTE_TIMER="amz-multi-public-routes.timer"
@@ -120,6 +121,10 @@ rand_uuid() { cat /proc/sys/kernel/random/uuid; }
 
 detect_nic() {
   ip route get 1.1.1.1 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' || true
+}
+
+detect_primary_ip() {
+  ip route get 1.1.1.1 2>/dev/null | awk '/ src / {for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true
 }
 
 ensure_pkgs() {
@@ -385,24 +390,53 @@ resolve_nic_for_ip() {
   printf '%s\n' "$PRIMARY_NIC"
 }
 
-routing_table_id_for_public_ip() {
+public_ip_is_primary_ip() {
+  local public_ip="$1"
+  [[ -n "$PRIMARY_IP" && "$public_ip" == "$PRIMARY_IP" ]]
+}
+
+public_ip_route_key() {
+  local public_ip="$1"
+  local _a b c d
+  IFS=. read -r _a b c d <<<"$public_ip"
+  printf '%s\n' "$(( (b << 16) | (c << 8) | d ))"
+}
+
+public_ip_requires_policy_route() {
   local public_ip="$1"
   local nic="${2:-$(resolve_nic_for_ip "$public_ip")}"
-  local ifindex=0
-  if [[ -r "/sys/class/net/${nic}/ifindex" ]]; then
-    ifindex="$(cat "/sys/class/net/${nic}/ifindex" 2>/dev/null || echo 0)"
+  local cidr prefix=""
+
+  if public_ip_is_primary_ip "$public_ip"; then
+    return 1
   fi
-  printf '%s\n' "$((200 + ifindex))"
+
+  cidr="$(cidr_for_nic_ip "$nic" "$public_ip" || true)"
+  [[ -n "$cidr" ]] && prefix="$(cidr_prefix "$cidr" || true)"
+
+  if [[ "$nic" != "$PRIMARY_NIC" ]]; then
+    return 0
+  fi
+
+  if [[ "$prefix" == "32" ]]; then
+    return 0
+  fi
+
+  return 1
+}
+
+routing_table_id_for_public_ip() {
+  local public_ip="$1"
+  local route_key
+  route_key="$(public_ip_route_key "$public_ip")"
+  printf '%s\n' "$((100000 + route_key))"
 }
 
 routing_priority_for_public_ip() {
   local public_ip="$1"
-  local nic="${2:-$(resolve_nic_for_ip "$public_ip")}"
-  local ifindex=0
-  if [[ -r "/sys/class/net/${nic}/ifindex" ]]; then
-    ifindex="$(cat "/sys/class/net/${nic}/ifindex" 2>/dev/null || echo 0)"
-  fi
-  printf '%s\n' "$((1000 + ifindex))"
+  local route_key
+  route_key="$(public_ip_route_key "$public_ip")"
+  printf '%s\n' "$((200000 + route_key))"
 }
 
 clear_policy_route_for_public_ip() {
@@ -560,12 +594,15 @@ gateway_for_nic_ip() {
 dump_public_route_debug() {
   local public_ip="$1"
   local nic="$2"
-  local table priority
+  local table priority requires_policy="no"
 
   table="$(routing_table_id_for_public_ip "$public_ip" "$nic")"
   priority="$(routing_priority_for_public_ip "$public_ip" "$nic")"
+  if public_ip_requires_policy_route "$public_ip" "$nic"; then
+    requires_policy="yes"
+  fi
 
-  route_debug "State for ${public_ip}: expected_nic=${nic} table=${table} priority=${priority}"
+  route_debug "State for ${public_ip}: expected_nic=${nic} table=${table} priority=${priority} primary_ip=${PRIMARY_IP:-unknown} requires_policy=${requires_policy}"
   route_debug "Bindings for ${public_ip}:"
   list_ip_bindings "$public_ip" 2>/dev/null | sed 's/^/[route-debug]   /' || true
   route_debug "ip route get 1.1.1.1 from ${public_ip}:"
@@ -656,6 +693,12 @@ apply_policy_route_for_public_ip() {
 
   clear_policy_route_for_public_ip "$public_ip" "$nic"
 
+  if ! public_ip_requires_policy_route "$public_ip" "$nic"; then
+    route_debug "No dedicated source route required for ${public_ip}; stale policy rules (if any) were cleared and main routing is left untouched"
+    ip route flush cache
+    return 0
+  fi
+
   if [[ "$nic" != "$PRIMARY_NIC" ]]; then
     remove_ip_alias "$PRIMARY_NIC" "$public_ip"
   fi
@@ -683,9 +726,12 @@ apply_policy_route_for_public_ip() {
 
 ensure_source_route_for_ip() {
   local public_ip="$1"
-  local expected_nic route_line route_dev probe_ok=1
+  local expected_nic route_line route_dev probe_ok=1 requires_policy=1
 
   expected_nic="$(resolve_nic_for_ip "$public_ip")"
+  if ! public_ip_requires_policy_route "$public_ip" "$expected_nic"; then
+    requires_policy=0
+  fi
   route_line="$(ip -4 route get 1.1.1.1 from "$public_ip" 2>/dev/null || true)"
   route_dev="$(route_dev_from_output "$route_line")"
 
@@ -698,7 +744,7 @@ ensure_source_route_for_ip() {
     route_debug "Egress probe for ${public_ip} failed or returned a different IP"
   fi
 
-  if [[ "$expected_nic" != "$PRIMARY_NIC" || "$probe_ok" -eq 0 ]]; then
+  if [[ "$requires_policy" -eq 1 || "$probe_ok" -eq 0 ]]; then
     warn "Source route for ${public_ip} exits via ${route_dev:-unknown}, attempting auto-fix on ${expected_nic}"
     dump_public_route_debug "$public_ip" "$expected_nic"
     apply_policy_route_for_public_ip "$public_ip" "$expected_nic"
@@ -794,8 +840,12 @@ EOF
       log "Persistence: ${ip} already has native prefix on ${nic} (${cidr})"
     fi
 
+    if ! public_ip_requires_policy_route "$ip" "$nic"; then
+      log "Persistence: ${ip} does not need a dedicated source route on ${nic}; main path is left untouched"
+      continue
+    fi
+
     if [[ -z "$connected_route" || -z "$gateway" ]]; then
-      [[ "$nic" != "$PRIMARY_NIC" ]] || continue
       connected_route="$(connected_route_for_nic_ip "$nic" "$ip" || true)"
       gateway="$(gateway_for_nic_ip "$nic" "$ip" || true)"
     fi
@@ -2202,6 +2252,9 @@ main() {
   nic="$(detect_nic || true)"
   [[ -n "$nic" ]] || err "Could not detect WAN interface"
   PRIMARY_NIC="$nic"
+  PRIMARY_IP="$(detect_primary_ip || true)"
+  [[ -n "$PRIMARY_IP" ]] || warn "Could not detect main source IP from default route; continuing"
+  log "Detected main uplink: nic=${PRIMARY_NIC} ip=${PRIMARY_IP:-unknown}"
 
   persist_sysctl_basic
   ensure_ip_aliases "$nic" "${IPS[@]}"
