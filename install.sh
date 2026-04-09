@@ -134,12 +134,67 @@ detect_primary_ip() {
   ip route get 1.1.1.1 2>/dev/null | awk '/ src / {for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true
 }
 
+pkg_is_installed() {
+  local pkg="$1"
+  dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "ok installed"
+}
+
+required_packages() {
+  local pkgs=(
+    curl
+    jq
+    iptables
+    iptables-persistent
+    ca-certificates
+    openssl
+  )
+
+  if [[ "$PROTO" == "awg" || "$PROTO" == "both" ]]; then
+    pkgs+=(perl)
+  fi
+
+  printf '%s\n' "${pkgs[@]}"
+}
+
 ensure_pkgs() {
+  local missing=()
+  local pkg
+
   export DEBIAN_FRONTEND=noninteractive
+  export NEEDRESTART_MODE=l
+  export NEEDRESTART_SUSPEND=1
+
+  while IFS= read -r pkg; do
+    [[ -z "$pkg" ]] && continue
+    if ! pkg_is_installed "$pkg"; then
+      missing+=("$pkg")
+    fi
+  done < <(required_packages)
+
+  if [[ "${#missing[@]}" -eq 0 ]]; then
+    log "All required system packages are already installed; skipping apt bootstrap"
+    return 0
+  fi
+
+  log "Installing missing system packages: ${missing[*]}"
   apt-get update -y
-  apt-get install -y \
-    curl wget jq iptables iptables-persistent ca-certificates \
-    openssl uuid-runtime unzip tar perl qrencode netcat-openbsd
+  apt-get install -y --no-install-recommends "${missing[@]}"
+}
+
+patch_awg_vendor_installer() {
+  local installer_path="$1"
+
+  [[ -f "$installer_path" ]] || return 0
+
+  if grep -q 'apt full-upgrade -y' "$installer_path"; then
+    perl -0pi -e 's/\n([ \t]*)log "Updating system\.\.\."\n([ \t]*)DEBIAN_FRONTEND=noninteractive apt full-upgrade -y \|\| die "apt full-upgrade error\."\n([ \t]*)log "System updated\."/\n$1log "Skipping full-upgrade (managed by amz-multi wrapper)."\n$1log "System update step completed."/' "$installer_path" || true
+  fi
+
+  if grep -q 'apt full-upgrade -y' "$installer_path"; then
+    warn "Could not patch AWG installer to skip full-upgrade; vendor script still contains apt full-upgrade"
+  else
+    log "Patched AWG installer to skip apt full-upgrade"
+  fi
 }
 
 make_dirs() {
@@ -1620,15 +1675,30 @@ ensure_xray_healthy() {
 }
 
 write_xray_summary() {
+  local first=1
+  local ip url
+
   : > "${OUT_DIR}/xray-clients.txt"
-  jq -r '
-    .xray.clients
-    | to_entries
-    | sort_by(.key)
-    | .[]
-    | .key, .value.url, "==="
-  ' "$STATE_FILE" >> "${OUT_DIR}/xray-clients.txt"
-  perl -0pi -e 's/\n===\n?\z/\n/s' "${OUT_DIR}/xray-clients.txt"
+
+  while IFS=$'\t' read -r ip url; do
+    [[ -z "$ip" || -z "$url" ]] && continue
+
+    if [[ "$first" -eq 0 ]]; then
+      printf '===\n' >> "${OUT_DIR}/xray-clients.txt"
+    fi
+
+    printf '%s\n%s\n' "$ip" "$url" >> "${OUT_DIR}/xray-clients.txt"
+    first=0
+  done < <(
+    jq -r '
+      .xray.clients
+      | to_entries
+      | sort_by(.key)
+      | .[]?
+      | [.key, .value.url]
+      | @tsv
+    ' "$STATE_FILE"
+  )
 }
 
 sync_xray() {
@@ -1692,6 +1762,7 @@ install_awg_base() {
   rm -f install_amneziawg_en.sh
   curl -fsSL "$AWG_INSTALL_SCRIPT_URL" -o /root/install_amneziawg_en.sh
   chmod +x /root/install_amneziawg_en.sh
+  patch_awg_vendor_installer /root/install_amneziawg_en.sh
 
   if AMZ_AWG_VENDOR_BASE_URL="$AWG_VENDOR_BASE_URL" bash /root/install_amneziawg_en.sh --yes --route-all --disallow-ipv6 --port="${port}"; then
     installer_rc=0
