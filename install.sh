@@ -673,30 +673,13 @@ guess_gateway_for_connected_route() {
 gateway_for_nic_ip() {
   local nic="$1"
   local public_ip="$2"
-  local gateway connected_route cidr prefix
-
-  cidr="$(cidr_for_nic_ip "$nic" "$public_ip" || true)"
-  prefix=""
-  [[ -n "$cidr" ]] && prefix="$(cidr_prefix "$cidr" || true)"
+  local gateway connected_route
 
   connected_route="$(connected_route_for_nic_ip "$nic" "$public_ip" || true)"
-  if [[ "$prefix" == "32" ]]; then
-    if gateway="$(guess_gateway_for_connected_route "$connected_route" "$public_ip" 2>/dev/null)"; then
-      warn "Guessing gateway ${gateway} for ${public_ip} on ${nic} from ${connected_route}"
-      printf '%s\n' "$gateway"
-      return 0
-    fi
-  fi
 
   gateway="$(ip -4 route show table main default dev "$nic" 2>/dev/null | awk '/^default via / {print $3; exit}')"
   if [[ -n "$gateway" ]]; then
     route_debug "Gateway for ${public_ip} on ${nic} found in main table default: ${gateway}"
-    printf '%s\n' "$gateway"
-    return 0
-  fi
-
-  if gateway="$(guess_gateway_for_connected_route "$connected_route" "$public_ip" 2>/dev/null)"; then
-    warn "Guessing gateway ${gateway} for ${public_ip} on ${nic} from ${connected_route}"
     printf '%s\n' "$gateway"
     return 0
   fi
@@ -768,10 +751,50 @@ source_egress_matches_ip() {
   [[ "$actual_ip" == "$public_ip" ]]
 }
 
+source_egress_probe_value_for_log() {
+  local public_ip="$1"
+  local actual_ip="${EGRESS_PROBE_VALUES[$public_ip]:-}"
+
+  if [[ -n "$actual_ip" ]]; then
+    printf '%s\n' "$actual_ip"
+  else
+    printf '<empty>\n'
+  fi
+}
+
 invalidate_source_egress_probe() {
   local public_ip="$1"
   unset 'EGRESS_PROBE_VALUES[$public_ip]' || true
   unset 'EGRESS_PROBE_DONE[$public_ip]' || true
+}
+
+replace_default_route_in_table() {
+  local gateway="$1"
+  local nic="$2"
+  local table="$3"
+  local preferred_src="${4:-}"
+
+  if [[ -n "$preferred_src" ]]; then
+    if ip route replace default via "$gateway" dev "$nic" src "$preferred_src" table "$table" 2>/dev/null; then
+      return 0
+    fi
+
+    route_debug "Default route via ${gateway} on ${nic} was rejected without onlink; retrying with onlink"
+    if ip route replace default via "$gateway" dev "$nic" src "$preferred_src" onlink table "$table" 2>/dev/null; then
+      return 0
+    fi
+    return 1
+  fi
+
+  if ip route replace default via "$gateway" dev "$nic" table "$table" 2>/dev/null; then
+    return 0
+  fi
+
+  route_debug "Default route via ${gateway} on ${nic} was rejected without onlink; retrying with onlink"
+  if ip route replace default via "$gateway" dev "$nic" onlink table "$table" 2>/dev/null; then
+    return 0
+  fi
+  return 1
 }
 
 ip_is_bound_to_nic() {
@@ -862,8 +885,8 @@ apply_policy_route_for_public_ip() {
   route_debug "Removing stale /32 alias from ${PRIMARY_NIC} for ${public_ip} if present"
   route_debug "Running: ip route replace ${connected_route} dev ${nic} src ${public_ip} table ${table}"
   ip route replace "$connected_route" dev "$nic" src "$public_ip" table "$table" 2>/dev/null || true
-  route_debug "Running: ip route replace default via ${gateway} dev ${nic} table ${table}"
-  ip route replace default via "$gateway" dev "$nic" table "$table" 2>/dev/null || true
+  route_debug "Running: ip route replace default via ${gateway} dev ${nic} src ${public_ip} table ${table}"
+  replace_default_route_in_table "$gateway" "$nic" "$table" "$public_ip" || warn "Could not install default route via ${gateway} on ${nic} in table ${table}"
   route_debug "Running: ip rule add from ${public_ip}/32 table ${table} priority ${priority}"
   ip rule add from "${public_ip}/32" table "$table" priority "$priority" 2>/dev/null || true
   ip route flush cache
@@ -884,7 +907,7 @@ ensure_source_route_for_ip() {
   route_dev="$(route_dev_from_output "$route_line")"
   if ! source_egress_matches_ip "$public_ip"; then
     probe_ok=0
-    route_debug "Egress probe for ${public_ip} failed or returned a different IP"
+    route_debug "Egress probe for ${public_ip} failed or returned a different IP (actual: $(source_egress_probe_value_for_log "$public_ip"))"
   fi
 
   if [[ "$route_dev" == "$expected_nic" && "$probe_ok" -eq 1 ]]; then
@@ -911,7 +934,12 @@ ensure_source_route_for_ip() {
     if ! source_egress_matches_ip "$public_ip"; then
       probe_ok=0
     fi
-    route_debug "${public_ip} still does not work via main-path fallback; dedicated policy route will be applied"
+    route_debug "${public_ip} still does not work via main-path fallback (actual: $(source_egress_probe_value_for_log "$public_ip"))"
+  fi
+
+  if [[ "$expected_nic" == "$PRIMARY_NIC" && "$prefix" == "32" && "$route_dev" == "$expected_nic" && "$probe_ok" -eq 0 ]]; then
+    dump_public_route_debug "$public_ip" "$expected_nic"
+    err "Main route for ${public_ip} exits via ${expected_nic}, but egress probe still does not return ${public_ip} (actual: $(source_egress_probe_value_for_log "$public_ip")). Fix provider routing for this IP first."
   fi
 
   if [[ "$requires_policy" -eq 1 || "$probe_ok" -eq 0 ]]; then
@@ -924,7 +952,7 @@ ensure_source_route_for_ip() {
     probe_ok=1
     if ! source_egress_matches_ip "$public_ip" 1; then
       probe_ok=0
-      route_debug "Egress probe for ${public_ip} still failed after auto-fix"
+      route_debug "Egress probe for ${public_ip} still failed after auto-fix (actual: $(source_egress_probe_value_for_log "$public_ip"))"
     fi
     route_debug "After auto-fix, route for ${public_ip}: ${route_line:-<empty>}"
   fi
@@ -1051,7 +1079,7 @@ EOF
         printf 'ip addr del %q dev %q 2>/dev/null || true\n' "${ip}/32" "$PRIMARY_NIC"
       fi
       printf 'ip route replace %q dev %q src %q table %q 2>/dev/null || true\n' "$connected_route" "$nic" "$ip" "$table"
-      printf 'ip route replace default via %q dev %q table %q 2>/dev/null || true\n' "$gateway" "$nic" "$table"
+      printf 'ip route replace default via %q dev %q src %q table %q 2>/dev/null || ip route replace default via %q dev %q src %q onlink table %q 2>/dev/null || true\n' "$gateway" "$nic" "$ip" "$table" "$gateway" "$nic" "$ip" "$table"
       printf 'ip rule add from %q table %q priority %q 2>/dev/null || true\n' "${ip}/32" "$table" "$priority"
     } >>"$script_path"
   done
@@ -1146,7 +1174,7 @@ validate_public_ip_persistence() {
     fi
 
     if ! source_egress_matches_ip "$ip"; then
-      egress_state="bad"
+      egress_state="bad($(source_egress_probe_value_for_log "$ip"))"
       failures=1
     fi
 
