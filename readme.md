@@ -2,16 +2,18 @@
 ### Xray
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/marshrmt/amz-multi-ip/main/install.sh | bash -s -- --proto xray --ips 203.0.113.11,203.0.113.12,203.0.113.13
+curl -fsSL https://raw.githubusercontent.com/marshrmt/amz-multi-ip/fix/xray-compat-0478/install.sh | bash -s -- --proto xray --ips 203.0.113.11,203.0.113.12,203.0.113.13
 ```
 
 - IP вводить без пробелов между запятыми
 - Vless ссылку можно скопировать в Амнезию или v2rayn клиент
+- Эта ветка основана на `0478e3d`: Xray закреплён на `26.7.28`, а Reality разрешает клиенты от `25.3.6`, включая встроенный Xray в Amnezia.
+- Повторный запуск заменяет другую установленную версию Xray и восстанавливает совместимые настройки. Существующие ключи, порты и клиентские ссылки сохраняются.
 
 ### AWG
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/marshrmt/amz-multi-ip/main/install.sh | bash -s -- --proto awg --ips 203.0.113.11,203.0.113.12,203.0.113.13
+curl -fsSL https://raw.githubusercontent.com/marshrmt/amz-multi-ip/fix/xray-compat-0478/install.sh | bash -s -- --proto awg --ips 203.0.113.11,203.0.113.12,203.0.113.13
 ```
 
 - IP вводить без пробелов между запятыми
@@ -22,7 +24,7 @@ curl -fsSL https://raw.githubusercontent.com/marshrmt/amz-multi-ip/main/install.
 ### Both (сразу оба)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/marshrmt/amz-multi-ip/main/install.sh | bash -s -- --proto both --ips 203.0.113.11,203.0.113.12,203.0.113.13
+curl -fsSL https://raw.githubusercontent.com/marshrmt/amz-multi-ip/fix/xray-compat-0478/install.sh | bash -s -- --proto both --ips 203.0.113.11,203.0.113.12,203.0.113.13
 ```
 
 - IP вводить без пробелов между запятыми

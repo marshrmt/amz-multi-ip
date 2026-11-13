@@ -14,12 +14,16 @@ STATE_FILE="${STATE_DIR}/installed.json"
 XRAY_DIR="/usr/local/etc/xray"
 XRAY_CONFIG="${XRAY_DIR}/config.json"
 XRAY_SERVICE="xray"
+# Keep compatibility with Amnezia clients bundling Xray 25.3.6.
+XRAY_VERSION="v26.7.28"
+XRAY_MIN_CLIENT_VERSION="25.3.6"
 
 AWG_DIR="/root/awg"
 AWG_SERVER_CONF="/etc/amnezia/amneziawg/awg0.conf"
 
 REPO_RAW_BASE="${REPO_RAW_BASE:-https://raw.githubusercontent.com/marshrmt/amz-multi-ip/main}"
-XRAY_INSTALL_SCRIPT_URL="${REPO_RAW_BASE}/vendor/xray-install/install-release.sh"
+# Preserve the existing service user and configuration permissions on upgrades.
+XRAY_INSTALL_SCRIPT_URL="https://raw.githubusercontent.com/XTLS/Xray-install/e741a4f56d368afbb9e5be3361b40c4552d3710d/install-release.sh"
 AWG_VENDOR_BASE_URL="${REPO_RAW_BASE}/vendor/amneziawg-installer"
 AWG_INSTALL_SCRIPT_URL="${AWG_VENDOR_BASE_URL}/install_amneziawg_en.sh"
 AWG_SETUP_STATE_FILE="${AWG_DIR}/setup_state"
@@ -887,16 +891,26 @@ choose_random_port() {
 }
 
 ensure_xray_installed() {
+  local current_version=""
+
   if command -v xray >/dev/null 2>&1; then
-    log "xray already installed"
-    return
+    current_version="$(xray version 2>/dev/null | awk 'NR==1 {print $2}' || true)"
+    if [[ "${current_version#v}" == "${XRAY_VERSION#v}" ]]; then
+      log "Xray ${XRAY_VERSION} already installed"
+      return
+    fi
   fi
 
-  log "Installing Xray"
+  log "Installing Xray ${XRAY_VERSION} (current: ${current_version:-not installed})"
   rm -f /root/install-release.sh
   curl -fsSL "$XRAY_INSTALL_SCRIPT_URL" -o /root/install-release.sh
   chmod +x /root/install-release.sh
-  bash /root/install-release.sh install
+  bash /root/install-release.sh install --version "$XRAY_VERSION" --no-update-service
+
+  hash -r
+  current_version="$(xray version 2>/dev/null | awk 'NR==1 {print $2}' || true)"
+  [[ "${current_version#v}" == "${XRAY_VERSION#v}" ]] \
+    || err "Expected Xray ${XRAY_VERSION}, but found ${current_version:-unknown} after installation"
 }
 
 ensure_xray_keys() {
@@ -1014,7 +1028,7 @@ build_xray_config() {
   mkdir -p "$XRAY_DIR"
   tmp="$(mktemp)"
 
-  jq -n --arg priv "$priv" --slurpfile st "$STATE_FILE" '
+  jq -n --arg priv "$priv" --arg min_client_ver "$XRAY_MIN_CLIENT_VERSION" --slurpfile st "$STATE_FILE" '
     ($st[0].xray.clients // {}) as $clients
     | {
         log: {
@@ -1047,6 +1061,7 @@ build_xray_config() {
                   xver: 0,
                   serverNames: [ .value.sni ],
                   privateKey: $priv,
+                  minClientVer: $min_client_ver,
                   shortIds: [ .value.short_id ]
                 }
               },
